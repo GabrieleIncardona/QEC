@@ -20,11 +20,9 @@ class ClusterNodeProgram(Program):
             local_qubits.append(row)
 
         # 2. Definizione dei socket EPR per i bordi
-        # Esempio: Se non sono l'ultima colonna, avrò un socket verso il vicino a destra
-        # epr_socket = EPRSocket("Nodo_Destra") 
+        
         
         # 3. Logica di errore/simulazione locale
-        # (Qui applicheresti i tuoi Pauli errors sulla sottomatrice)
 
         yield from connection.flush()
         return {"status": "Subgrid initialized", "coords": self.node_coords}
