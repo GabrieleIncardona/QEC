@@ -35,7 +35,7 @@ class ClusterNodeProgram(Program):
             epr_socket_left = context.get_epr_socket(neighbor_left)
             for r_idx in range(self.layout_manager.block_size):
                 # Create EPR pair and keep the local qubit
-                epr_qubit_left = epr_socket_left.recv_keep(number=1)[0]
+                epr_qubit_left = epr_socket_left.recv_keep()[0]
                 self.epr_borders["LEFT"].append(epr_qubit_left)
                 yield from connection.flush()
 
@@ -46,7 +46,7 @@ class ClusterNodeProgram(Program):
             epr_socket_up = context.get_epr_socket(neighbor_up)
             
             for c_idx in range(self.layout_manager.block_size):
-                epr_qubit_up = epr_socket_up.recv_keep(number=1)[0]
+                epr_qubit_up = epr_socket_up.recv_keep()[0]
                 self.epr_borders["UP"].append(epr_qubit_up)
                 yield from connection.flush()
         
@@ -62,3 +62,6 @@ class ClusterNodeProgram(Program):
         
         
         yield from connection.flush()
+
+        # Z stabilizer measurement
+        if 

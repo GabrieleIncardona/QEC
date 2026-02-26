@@ -12,7 +12,7 @@ class SurfaceLayout:
         for r in range(r_start, r_start + self.block_size):
             row = []
             for c in range(c_start, c_start + self.block_size):
-                role = "pQ" if (r + c) % 2 == 0 else ("zQ" if r % 2 == 0 else "xQ")
+                role = "pQ" if (r + c) % 2 == 0 else ("zQ" if c % 2 == 0 else "xQ")
                 
                 # Check if this qubit is on the border of the subgrid (for potential EPR connections)
                 is_border = (r == r_start or r == r_start + self.block_size - 1 or

@@ -9,8 +9,8 @@ from surface_code import SurfaceLayout
 from dis_surface_code import ClusterNodeProgram
 
 def main():
-    global_size = 9        # planar surface code with 9x9 qubits (81 qubits)
-    nodes_per_side = 3     # Rete di nodi 3x3 (9 node)
+    global_size = 13        # planar surface code with 13x13 qubits (139 qubits)
+    nodes_per_side = 3     
     
     # 1. Creation of the Surface Layout Manager
     layout_manager = SurfaceLayout(global_size, nodes_per_side)
