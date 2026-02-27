@@ -2,6 +2,8 @@ from squidasm.sim.stack.program import Program, ProgramContext, ProgramMeta
 from netqasm.sdk.qubit import Qubit
 from netqasm.sdk.epr_socket import EPRSocket
 
+import random
+
 class ClusterNodeProgram(Program):
     def __init__(self, node_coords, layout_manager):
         self.node_coords = node_coords
@@ -85,6 +87,16 @@ class ClusterNodeProgram(Program):
                 row_roles.append(cell["role"])
             self.local_qubits.append(row_q)
             self.qubit_roles.append(row_roles)
+
+    
+    def _apply_noise(self):
+        B = self.layout_manager.block_size
+        probability = 0.01
+        for r in range(B):
+            for c in range(B):
+                if self.qubit_roles[r][c] == "pQ":
+                    if random.random() < probability:
+                        self.local_qubits[r][c].X()  # Simulation of a bit-flip error on data qubits
 
     # Phase 3: Measure stabilizers and accumulate pending sends
     def _measure_stabilizers(self, context):
@@ -196,28 +208,28 @@ class ClusterNodeProgram(Program):
 
         if r_node < N - 1:   # receive from DOWN
             neighbor = f"node_{r_node + 1}_{c_node}"
-            n_msgs = len(self.epr_index_map["DOWN"])  # simmetrico al bordo UP del vicino
+            n_msgs = len(self.epr_index_map["DOWN"])
             for _ in range(n_msgs):
                 msg = yield from conn.receive_classical(neighbor)
                 received["DOWN"].append((msg[0], msg[1]))
 
         if r_node > 0:       # receive from UP
             neighbor = f"node_{r_node - 1}_{c_node}"
-            n_msgs = len(self.epr_index_map["UP"])    # simmetrico al bordo DOWN del vicino
+            n_msgs = len(self.epr_index_map["UP"])
             for _ in range(n_msgs):
                 msg = yield from conn.receive_classical(neighbor)
                 received["UP"].append((msg[0], msg[1]))
 
         if c_node < N - 1:   # receive from RIGHT
             neighbor = f"node_{r_node}_{c_node + 1}"
-            n_msgs = len(self.epr_index_map["RIGHT"]) # simmetrico al bordo LEFT del vicino
+            n_msgs = len(self.epr_index_map["RIGHT"])
             for _ in range(n_msgs):
                 msg = yield from conn.receive_classical(neighbor)
                 received["RIGHT"].append((msg[0], msg[1]))
 
         if c_node > 0:       # receive from LEFT
             neighbor = f"node_{r_node}_{c_node - 1}"
-            n_msgs = len(self.epr_index_map["LEFT"])  # simmetrico al bordo RIGHT del vicino
+            n_msgs = len(self.epr_index_map["LEFT"])
             for _ in range(n_msgs):
                 msg = yield from conn.receive_classical(neighbor)
                 received["LEFT"].append((msg[0], msg[1]))
