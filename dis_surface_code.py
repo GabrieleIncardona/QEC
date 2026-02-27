@@ -261,6 +261,7 @@ class ClusterNodeProgram(Program):
         yield from self._setup_epr_borders(context, subgrid_data)
 
         self._allocate_local_qubits(context, subgrid_data)
+        self._apply_noise()
         yield from self._measure_stabilizers(context)
         yield from self._exchange_classical_corrections(context)
 
