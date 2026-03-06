@@ -1,9 +1,11 @@
 import traceback
-from netsquid_netbuilder.util.network_generation import create_complete_graph_network
-from netsquid_magic.models.perfect import PerfectLinkConfig
-from netsquid_magic.models.clink import DefaultCLinkConfig
-from squidasm.run.stack.run import run as run_simulation
 
+
+from squidasm.run.stack.run import run as run_simulation
+from squidasm.util.util import create_complete_graph_network
+#from squidasm.run.stack.config import DepolariseLinkConfig, DefaultCLinkConfig, GenericQDeviceConfig
+from netsquid_netbuilder.modules.qlinks.perfect import PerfectQLinkConfig
+from netsquid_netbuilder.modules.clinks.default import DefaultCLinkConfig
 
 from surface_code import SurfaceLayout
 from dis_surface_code import ClusterNodeProgram
@@ -23,10 +25,10 @@ def main():
 
     # 3. Configuration of the Network
     cfg = create_complete_graph_network(
-        node_names,
-        "perfect",
-        PerfectLinkConfig(state_delay=0),
-        clink_typ="default",
+        node_names=node_names,
+        link_typ="perfect",
+        link_cfg=PerfectQLinkConfig(state_delay=0),
+        clink_typ="default", # classical Link
         clink_cfg=DefaultCLinkConfig(delay=0),
     )
 
@@ -41,15 +43,15 @@ def main():
             )
 
     # 5. Run the simulation
-    print(f"Run simulation of Surface Code Distribuito...")
+    print(f"Run simulation of Distribuit Surface Code...")
     print(f"global grid: {global_size}x{global_size}")
     print(f"number node: {len(node_names)} (every node menage {layout_manager.block_size}x{layout_manager.block_size} qubit)")
     
     try:
         results = run_simulation(config=cfg, programs=programs, num_times=1)
         print("\n--- RISULTS ---")
-        for node, data in results.items():
-            print(f"{node}: {data}")
+        """for node, data in results.items():
+            print(f"{node}: {data}")"""
             
     except Exception as e:
         print(f"Error: {e}")

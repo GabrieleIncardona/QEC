@@ -8,7 +8,30 @@ class ClusterNodeProgram(Program):
     def __init__(self, node_coords, layout_manager):
         self.node_coords = node_coords
         self.layout_manager = layout_manager
+        self.list_linked_neighbors = []
+        r, c = self.node_coords
+        N = self.layout_manager.nodes_per_side
+        
+        self.neighbors = []
+        if r > 0:
+            self.neighbors.append(f"node_{r-1}_{c}")  # UP
+        if r < N - 1:
+            self.neighbors.append(f"node_{r+1}_{c}")  # DOWN
+        if c > 0:
+            self.neighbors.append(f"node_{r}_{c-1}")  # LEFT
+        if c < N - 1:
+            self.neighbors.append(f"node_{r}_{c+1}")  # RIGHT
 
+    @property
+    def meta(self) -> ProgramMeta:
+        B = self.layout_manager.block_size
+        return ProgramMeta(
+            name=f"node_{self.node_coords[0]}_{self.node_coords[1]}",
+            csockets=self.neighbors,
+            epr_sockets=self.neighbors,
+            max_qubits=B * B + 4 * B,  # upper bound: all local qubits + all potential border EPRs
+        )
+    
     # Phase 1: Set up EPR pairs on borders with neighbors
     def _setup_epr_borders(self, context, subgrid_data):
         r, c = self.node_coords
@@ -46,28 +69,28 @@ class ClusterNodeProgram(Program):
 
         # RIGHT — this node is initiator
         if c < N - 1:
-            sock = context.get_epr_socket(f"node_{r}_{c + 1}")
+            sock = context.epr_sockets[f"node_{r}_{c + 1}"]
             for _ in range(n_right):
                 borders["RIGHT"].append(sock.create_keep()[0])
                 yield from conn.flush()
 
         # LEFT — this node is responder
         if c > 0:
-            sock = context.get_epr_socket(f"node_{r}_{c - 1}")
+            sock = context.epr_sockets[f"node_{r}_{c - 1}"]
             for _ in range(n_left):
                 borders["LEFT"].append(sock.recv_keep()[0])
                 yield from conn.flush()
 
         # UP — this node is responder
         if r > 0:
-            sock = context.get_epr_socket(f"node_{r - 1}_{c}")
+            sock = context.epr_sockets[f"node_{r - 1}_{c}"]
             for _ in range(n_up):
                 borders["UP"].append(sock.recv_keep()[0])
                 yield from conn.flush()
 
         # DOWN — this node is initiator
         if r < N - 1:
-            sock = context.get_epr_socket(f"node_{r + 1}_{c}")
+            sock = context.epr_sockets[f"node_{r + 1}_{c}"]
             for _ in range(n_down):
                 borders["DOWN"].append(sock.create_keep()[0])
                 yield from conn.flush()
@@ -182,57 +205,61 @@ class ClusterNodeProgram(Program):
 
         # SEND
         if r_node > 0:
-            neighbor = f"node_{r_node - 1}_{c_node}"
+            csock = context.csockets[f"node_{r_node - 1}_{c_node}"]
             for idx, m in self.pending_sends["UP"]:
-                conn.send_classical(neighbor, [idx, m])
+                csock.send(str([idx, m]))
 
         if r_node < N - 1:
-            neighbor = f"node_{r_node + 1}_{c_node}"
+            csock = context.csockets[f"node_{r_node + 1}_{c_node}"]
             for idx, m in self.pending_sends["DOWN"]:
-                conn.send_classical(neighbor, [idx, m])
+                csock.send(str([idx, m]))
 
         if c_node > 0:
-            neighbor = f"node_{r_node}_{c_node - 1}"
+            csock = context.csockets[f"node_{r_node}_{c_node - 1}"]
             for idx, m in self.pending_sends["LEFT"]:
-                conn.send_classical(neighbor, [idx, m])
+                csock.send(str([idx, m]))
 
         if c_node < N - 1:
-            neighbor = f"node_{r_node}_{c_node + 1}"
+            csock = context.csockets[f"node_{r_node}_{c_node + 1}"]
             for idx, m in self.pending_sends["RIGHT"]:
-                conn.send_classical(neighbor, [idx, m])
+                csock.send(str([idx, m]))
 
         yield from conn.flush()
 
-        # RECEIVE — the neighbor's sent messages correspond to this node's opposite border
+        # RECEIVE
         received = {"UP": [], "DOWN": [], "LEFT": [], "RIGHT": []}
 
-        if r_node < N - 1:   # receive from DOWN
-            neighbor = f"node_{r_node + 1}_{c_node}"
+        if r_node < N - 1:
+            csock = context.csockets[f"node_{r_node + 1}_{c_node}"]
             n_msgs = len(self.epr_index_map["DOWN"])
             for _ in range(n_msgs):
-                msg = yield from conn.receive_classical(neighbor)
-                received["DOWN"].append((msg[0], msg[1]))
+                msg = yield from csock.recv()
+                parsed = eval(msg)
+                received["DOWN"].append((parsed[0], parsed[1]))
 
-        if r_node > 0:       # receive from UP
-            neighbor = f"node_{r_node - 1}_{c_node}"
+        if r_node > 0:
+            csock = context.csockets[f"node_{r_node - 1}_{c_node}"]
             n_msgs = len(self.epr_index_map["UP"])
             for _ in range(n_msgs):
-                msg = yield from conn.receive_classical(neighbor)
-                received["UP"].append((msg[0], msg[1]))
+                msg = yield from csock.recv()
+                parsed = eval(msg)
+                received["UP"].append((parsed[0], parsed[1]))
 
-        if c_node < N - 1:   # receive from RIGHT
-            neighbor = f"node_{r_node}_{c_node + 1}"
+        if c_node < N - 1:
+            csock = context.csockets[f"node_{r_node}_{c_node + 1}"]
             n_msgs = len(self.epr_index_map["RIGHT"])
             for _ in range(n_msgs):
-                msg = yield from conn.receive_classical(neighbor)
-                received["RIGHT"].append((msg[0], msg[1]))
+                msg = yield from csock.recv()
+                parsed = eval(msg)
+                received["RIGHT"].append((parsed[0], parsed[1]))
 
-        if c_node > 0:       # receive from LEFT
-            neighbor = f"node_{r_node}_{c_node - 1}"
+        if c_node > 0:
+            csock = context.csockets[f"node_{r_node}_{c_node - 1}"]
             n_msgs = len(self.epr_index_map["LEFT"])
             for _ in range(n_msgs):
-                msg = yield from conn.receive_classical(neighbor)
-                received["LEFT"].append((msg[0], msg[1]))
+                msg = yield from csock.recv()
+                parsed = eval(msg)
+                received["LEFT"].append((parsed[0], parsed[1]))
 
         self.received_corrections = received
 
