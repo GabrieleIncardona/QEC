@@ -1,135 +1,107 @@
+"""
+Distributed Surface Code — ClusterNodeProgram
+Full quantum protocol using local CNOT gates and teleported CNOT via EPR
+for cross-border stabilizer measurements.
+
+Syndrome measurement strategy
+
+Border stabilizers (ancilla in node A, one data qubit in node B):
+  Teleported CNOT protocol. Since the ancilla is already measured, the
+  protocol computes only the parity contribution of the neighbor data qubit
+  and XORs it into the already-stored ancilla_measurements value.
+
+Teleported CNOT — parity extraction
+-------------------------------------
+determine the parity contribution of data qubit d_B (in node B)
+to stabilizer ancilla q_A.
+
+For xQ (ancilla controls, data is target):
+  1. Node A creates EPR (eA, eB); sends eB to B.
+  2. A sends role="xQ" to B.
+  3. B: CNOT(eB → d_B); measures eB → m_B.
+  4. A: measures eA in X basis (H then measure) → m_A.
+     Parity XOR contribution = m_B.
+
+For zQ (data controls, ancilla is target):
+  1–2. Same EPR setup and role signal.
+  3. B: CNOT(d_B → eB); measures eB → m_B.
+  4. A: measures eA in Z basis → m_A.
+     Parity XOR contribution = m_A.
+"""
+
+import json
+import random
+import numpy as np
+
 from squidasm.sim.stack.program import Program, ProgramContext, ProgramMeta
 from netqasm.sdk.qubit import Qubit
-from netqasm.sdk.epr_socket import EPRSocket
 
-import random
 
 class ClusterNodeProgram(Program):
-    def __init__(self, node_coords, layout_manager):
+    # Constants
+    NOISE_PROBABILITY = 0.01  # Bit-flip probability on data qubits
+    ENERGY_THRESHOLD = 0.95   # SVD energy threshold for compression
+
+    def __init__(self, node_coords: tuple, layout_manager, coordinator_name: str = "coordinator"):
         self.node_coords = node_coords
         self.layout_manager = layout_manager
-        self.list_linked_neighbors = []
-        r, c = self.node_coords
-        N = self.layout_manager.nodes_per_side
-        
+        self.coordinator_name = coordinator_name
+
+        r, c = node_coords
+        N = layout_manager.nodes_per_side
         self.neighbors = []
         if r > 0:
-            self.neighbors.append(f"node_{r-1}_{c}")  # UP
-        if r < N - 1:
-            self.neighbors.append(f"node_{r+1}_{c}")  # DOWN
+            self.neighbors.append(f"node_{r-1}_{c}")
+        if r < N-1:
+            self.neighbors.append(f"node_{r+1}_{c}")
         if c > 0:
-            self.neighbors.append(f"node_{r}_{c-1}")  # LEFT
-        if c < N - 1:
-            self.neighbors.append(f"node_{r}_{c+1}")  # RIGHT
+            self.neighbors.append(f"node_{r}_{c-1}")
+        if c < N-1:
+            self.neighbors.append(f"node_{r}_{c+1}")
 
     @property
     def meta(self) -> ProgramMeta:
         B = self.layout_manager.block_size
         return ProgramMeta(
             name=f"node_{self.node_coords[0]}_{self.node_coords[1]}",
-            csockets=self.neighbors,
+            csockets=self.neighbors + [self.coordinator_name],
             epr_sockets=self.neighbors,
-            max_qubits=B * B + 4 * B,  # upper bound: all local qubits + all potential border EPRs
+            max_qubits=B * B + B,
         )
     
-    # Phase 1: Set up EPR pairs on borders with neighbors
-    def _setup_epr_borders(self, context, subgrid_data):
-        r, c = self.node_coords
-        N = self.layout_manager.nodes_per_side
+    # Run
+    def run(self, context: ProgramContext):
+        conn = context.connection
+        subgrid_data = self.layout_manager.get_subgrid_for_node(*self.node_coords)
         B = self.layout_manager.block_size
-        conn = context.connection
 
-        borders = {"RIGHT": [], "LEFT": [], "UP": [], "DOWN": []}
+        self.injected_errors      = set()
+        self.applied_corrections  = set()
+        self.ancilla_measurements = {}
 
-        # Map for saving the index of EPR pairs for each border, based on the subgrid roles
-        self.epr_index_map = {"UP": {}, "DOWN": {}, "LEFT": {}, "RIGHT": {}}
-
-        # UP/DOWN → index by column c
-        for col in range(B):
-            if subgrid_data[0][col]["role"] in ("xQ", "zQ"):
-                idx = len(self.epr_index_map["UP"])
-                self.epr_index_map["UP"][col] = idx
-            if subgrid_data[B - 1][col]["role"] in ("xQ", "zQ"):
-                idx = len(self.epr_index_map["DOWN"])
-                self.epr_index_map["DOWN"][col] = idx
-
-        # LEFT/RIGHT → index by row r
-        for row in range(B):
-            if subgrid_data[row][0]["role"] in ("xQ", "zQ"):
-                idx = len(self.epr_index_map["LEFT"])
-                self.epr_index_map["LEFT"][row] = idx
-            if subgrid_data[row][B - 1]["role"] in ("xQ", "zQ"):
-                idx = len(self.epr_index_map["RIGHT"])
-                self.epr_index_map["RIGHT"][row] = idx
-
-        n_up    = len(self.epr_index_map["UP"])
-        n_down  = len(self.epr_index_map["DOWN"])
-        n_left  = len(self.epr_index_map["LEFT"])
-        n_right = len(self.epr_index_map["RIGHT"])
-
-        # RIGHT — this node is initiator
-        if c < N - 1:
-            sock = context.epr_sockets[f"node_{r}_{c + 1}"]
-            for _ in range(n_right):
-                borders["RIGHT"].append(sock.create_keep()[0])
-                yield from conn.flush()
-
-        # LEFT — this node is responder
-        if c > 0:
-            sock = context.epr_sockets[f"node_{r}_{c - 1}"]
-            for _ in range(n_left):
-                borders["LEFT"].append(sock.recv_keep()[0])
-                yield from conn.flush()
-
-        # UP — this node is responder
-        if r > 0:
-            sock = context.epr_sockets[f"node_{r - 1}_{c}"]
-            for _ in range(n_up):
-                borders["UP"].append(sock.recv_keep()[0])
-                yield from conn.flush()
-
-        # DOWN — this node is initiator
-        if r < N - 1:
-            sock = context.epr_sockets[f"node_{r + 1}_{c}"]
-            for _ in range(n_down):
-                borders["DOWN"].append(sock.create_keep()[0])
-                yield from conn.flush()
-
-        self.epr_borders = borders
-
-    # Phase 2: Allocate local qubits based on subgrid data
-    def _allocate_local_qubits(self, context, subgrid_data):
-        conn = context.connection
-        self.local_qubits = []
-        self.qubit_roles = []
-
+        # 1. Allocate qubits
+        self.local_qubits, self.qubit_roles = [], []
         for row in subgrid_data:
-            row_q, row_roles = [], []
+            row_q, row_r = [], []
             for cell in row:
                 row_q.append(Qubit(conn))
-                row_roles.append(cell["role"])
+                row_r.append(cell["role"])
             self.local_qubits.append(row_q)
-            self.qubit_roles.append(row_roles)
+            self.qubit_roles.append(row_r)
 
-    
-    def _apply_noise(self):
-        B = self.layout_manager.block_size
-        probability = 0.01
+        # 2. Apply noise (bit-flip on data qubits)
         for r in range(B):
             for c in range(B):
-                if self.qubit_roles[r][c] == "pQ":
-                    if random.random() < probability:
-                        self.local_qubits[r][c].X()  # Simulation of a bit-flip error on data qubits
+                if self.qubit_roles[r][c] == "pQ" and random.random() < self.NOISE_PROBABILITY:
+                    self.local_qubits[r][c].X()
+                    self.injected_errors.add((r, c))
 
-    # Phase 3: Measure stabilizers and accumulate pending sends
-    def _measure_stabilizers(self, context):
-        conn = context.connection
-        r_node, c_node = self.node_coords
-        B = self.layout_manager.block_size
-        N = self.layout_manager.nodes_per_side
+        if self.injected_errors:
+            print(f"[{self.node_coords}] Noise: {len(self.injected_errors)} qubit(s) → {sorted(self.injected_errors)}")
+        else:
+            print(f"[{self.node_coords}] Noise: none")
 
-        self.pending_sends = {"RIGHT": [], "LEFT": [], "UP": [], "DOWN": []}
-
+        # 3. Measure interior stabilizers.
         for r in range(B):
             for c in range(B):
                 role = self.qubit_roles[r][c]
@@ -138,159 +110,312 @@ class ClusterNodeProgram(Program):
 
                 ancilla = self.local_qubits[r][c]
 
-                if role == "zQ":
+                if role == "xQ":
                     ancilla.H()
 
-                # Neighboring qubits in the same subgrid
-                interior_neighbors = []
-                if r > 0:
-                    interior_neighbors.append(self.local_qubits[r - 1][c])
-                if r < B - 1:
-                    interior_neighbors.append(self.local_qubits[r + 1][c])
-                if c > 0:
-                    interior_neighbors.append(self.local_qubits[r][c - 1])
-                if c < B - 1:
-                    interior_neighbors.append(self.local_qubits[r][c + 1])
+                for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                    nr, nc = r + dr, c + dc
+                    if 0 <= nr < B and 0 <= nc < B and self.qubit_roles[nr][nc] == "pQ":
+                        data = self.local_qubits[nr][nc]
+                        if role == "xQ":
+                            ancilla.cnot(data)
+                        else:
+                            data.cnot(ancilla)
 
-                for nq in interior_neighbors:
-                    ancilla.cnot(nq)
-
-                # Edge UP — use the map for index lookup
-                if r == 0 and r_node > 0 and c in self.epr_index_map["UP"]:
-                    epr_idx = self.epr_index_map["UP"][c]
-                    epr = self.epr_borders["UP"][epr_idx]
-                    ancilla.cnot(epr)
-                    m = epr.measure()
-                    yield from conn.flush()
-                    self.pending_sends["UP"].append((c, int(m)))
-
-                # Edge DOWN
-                if r == B - 1 and r_node < N - 1 and c in self.epr_index_map["DOWN"]:
-                    epr_idx = self.epr_index_map["DOWN"][c]
-                    epr = self.epr_borders["DOWN"][epr_idx]
-                    ancilla.cnot(epr)
-                    m = epr.measure()
-                    yield from conn.flush()
-                    self.pending_sends["DOWN"].append((c, int(m)))
-
-                # Edge LEFT
-                if c == 0 and c_node > 0 and r in self.epr_index_map["LEFT"]:
-                    epr_idx = self.epr_index_map["LEFT"][r]
-                    epr = self.epr_borders["LEFT"][epr_idx]
-                    ancilla.cnot(epr)
-                    m = epr.measure()
-                    yield from conn.flush()
-                    self.pending_sends["LEFT"].append((r, int(m)))
-
-                # Edge RIGHT
-                if c == B - 1 and c_node < N - 1 and r in self.epr_index_map["RIGHT"]:
-                    epr_idx = self.epr_index_map["RIGHT"][r]
-                    epr = self.epr_borders["RIGHT"][epr_idx]
-                    ancilla.cnot(epr)
-                    m = epr.measure()
-                    yield from conn.flush()
-                    self.pending_sends["RIGHT"].append((r, int(m)))
-
-                if role == "zQ":
+                if role == "xQ":
                     ancilla.H()
 
-                ancilla.measure()
+                m = ancilla.measure()
                 yield from conn.flush()
+                self.ancilla_measurements[(r, c)] = int(m)
 
-    # Phase 4: Exchange classical corrections with neighbors (all sends → all receives)
-    def _exchange_classical_corrections(self, context):
-        conn = context.connection
+        # 4. Border stabilizer contributions via teleported CNOT.
+        border_xors = yield from self._teleported_cnot_borders(context)
+        for (r, c), bit in border_xors.items():
+            self.ancilla_measurements[(r, c)] = (
+                self.ancilla_measurements.get((r, c), 0) ^ bit
+            )
+
+        # 5. Build SVD payload, communicate with coordinator, apply corrections
+        payload = self._build_svd_payload()
+        corrections = yield from self._communicate_with_coordinator(context, payload)
+        self._apply_corrections(corrections)
+
+        if self.applied_corrections:
+            print(f"[{self.node_coords}] Corrections: {sorted(self.applied_corrections)}")
+        else:
+            print(f"[{self.node_coords}] Corrections: none")
+
+        # 6. Send logical-Z parity to coordinator
+        yield from self._send_logical_parity(context)
+        yield from conn.flush()
+
+    # Step 4 — Teleported CNOT border protocol
+    def _teleported_cnot_borders(self, context) -> dict:
+        """
+        Process all four border directions and return a dict of
+        {(local_r, local_c): parity_bit} for ancilla-side nodes.
+        Directions are processed in two waves to keep partner nodes in sync.
+        """
         r_node, c_node = self.node_coords
         N = self.layout_manager.nodes_per_side
+        B = self.layout_manager.block_size
+        xors = {}
 
-        # SEND
-        if r_node > 0:
-            csock = context.csockets[f"node_{r_node - 1}_{c_node}"]
-            for idx, m in self.pending_sends["UP"]:
-                csock.send(str([idx, m]))
-
-        if r_node < N - 1:
-            csock = context.csockets[f"node_{r_node + 1}_{c_node}"]
-            for idx, m in self.pending_sends["DOWN"]:
-                csock.send(str([idx, m]))
+        # Wave 1: horizontal (RIGHT then LEFT)
+        if c_node < N - 1:
+            result = yield from self._run_border_direction(context,
+                neighbor = f"node_{r_node}_{c_node+1}",
+                is_ancilla_side = True,
+                axis = "col",
+                local_fixed = B - 1,
+            )
+            xors.update(result)
 
         if c_node > 0:
-            csock = context.csockets[f"node_{r_node}_{c_node - 1}"]
-            for idx, m in self.pending_sends["LEFT"]:
-                csock.send(str([idx, m]))
+            yield from self._run_border_direction(context,
+                neighbor = f"node_{r_node}_{c_node-1}",
+                is_ancilla_side = False,
+                axis = "col",
+                local_fixed = 0,
+            )
 
-        if c_node < N - 1:
-            csock = context.csockets[f"node_{r_node}_{c_node + 1}"]
-            for idx, m in self.pending_sends["RIGHT"]:
-                csock.send(str([idx, m]))
-
-        yield from conn.flush()
-
-        # RECEIVE
-        received = {"UP": [], "DOWN": [], "LEFT": [], "RIGHT": []}
-
+        # Wave 2: vertical (DOWN then UP)
         if r_node < N - 1:
-            csock = context.csockets[f"node_{r_node + 1}_{c_node}"]
-            n_msgs = len(self.epr_index_map["DOWN"])
-            for _ in range(n_msgs):
-                msg = yield from csock.recv()
-                parsed = eval(msg)
-                received["DOWN"].append((parsed[0], parsed[1]))
+            result = yield from self._run_border_direction(context,
+                neighbor = f"node_{r_node+1}_{c_node}",
+                is_ancilla_side = True,
+                axis = "row",
+                local_fixed = B - 1,
+            )
+            xors.update(result)
 
         if r_node > 0:
-            csock = context.csockets[f"node_{r_node - 1}_{c_node}"]
-            n_msgs = len(self.epr_index_map["UP"])
-            for _ in range(n_msgs):
-                msg = yield from csock.recv()
-                parsed = eval(msg)
-                received["UP"].append((parsed[0], parsed[1]))
+            yield from self._run_border_direction(context,
+                neighbor = f"node_{r_node-1}_{c_node}",
+                is_ancilla_side = False,
+                axis = "row",
+                local_fixed = 0,
+            )
 
-        if c_node < N - 1:
-            csock = context.csockets[f"node_{r_node}_{c_node + 1}"]
-            n_msgs = len(self.epr_index_map["RIGHT"])
-            for _ in range(n_msgs):
-                msg = yield from csock.recv()
-                parsed = eval(msg)
-                received["RIGHT"].append((parsed[0], parsed[1]))
+        return xors
 
-        if c_node > 0:
-            csock = context.csockets[f"node_{r_node}_{c_node - 1}"]
-            n_msgs = len(self.epr_index_map["LEFT"])
-            for _ in range(n_msgs):
-                msg = yield from csock.recv()
-                parsed = eval(msg)
-                received["LEFT"].append((parsed[0], parsed[1]))
+    def _run_border_direction(self, context, *, neighbor: str, is_ancilla_side: bool, axis: str, local_fixed: int) -> dict:
+        """
+        Process one border direction index by index.
 
-        self.received_corrections = received
-
-    # Phase 5: Apply corrections on border qubits based on received measurements
-    def _apply_corrections(self):
-        for idx, m in self.received_corrections.get("UP", []):
-            if m == 1:
-                self.local_qubits[0][idx].X()
-
-        for idx, m in self.received_corrections.get("DOWN", []):
-            if m == 1:
-                self.local_qubits[-1][idx].X()
-
-        for idx, m in self.received_corrections.get("LEFT", []):
-            if m == 1:
-                self.local_qubits[idx][0].X()
-
-        for idx, m in self.received_corrections.get("RIGHT", []):
-            if m == 1:
-                self.local_qubits[idx][-1].X()
-
-    def run(self, context: ProgramContext):
+        Each index goes through 4 synchronized rounds:
+          A. EPR setup: create_keep / recv_keep
+          B. Role signal: send/recv "xQ"/"zQ"/"skip"
+          C. Gate + measure on both sides
+          D. Classical bit exchange
+        """
         conn = context.connection
-        subgrid_data = self.layout_manager.get_subgrid_for_node(*self.node_coords)
+        B = self.layout_manager.block_size
+        csock = context.csockets[neighbor]
+        epr_sock = context.epr_sockets[neighbor]
+        xor_bits = {}
 
-        yield from self._setup_epr_borders(context, subgrid_data)
+        for idx in range(B):
+            r_loc = local_fixed if axis == "row" else idx
+            c_loc = idx if axis == "row" else local_fixed
 
-        self._allocate_local_qubits(context, subgrid_data)
-        self._apply_noise()
-        yield from self._measure_stabilizers(context)
-        yield from self._exchange_classical_corrections(context)
+            if is_ancilla_side:
+                anc_role = self.qubit_roles[r_loc][c_loc]
+                role_signal = anc_role if anc_role in ("xQ", "zQ") else "skip"
 
-        self._apply_corrections()
-        yield from conn.flush()
+                # Round A: create EPR
+                eA = epr_sock.create_keep()[0]
+                yield from conn.flush()
+
+                # Round B: send role signal
+                csock.send(role_signal)
+                yield from conn.flush()
+
+                if role_signal == "skip":
+                    # Round C: free the EPR qubit
+                    eA.measure()
+                    yield from conn.flush()
+                    # Round D: consume dummy ack
+                    yield from csock.recv()
+                    continue
+
+                # Round C: measure eA in Z basis
+                m_A = eA.measure()
+                yield from conn.flush()
+                m_A_val = int(m_A)
+
+                # Round D: receive m_B from data side
+                m_B_val = int((yield from csock.recv()))
+
+                xor_bits[(r_loc, c_loc)] = m_A_val ^ m_B_val
+
+            else:
+                # Round A: receive EPR half
+                eB = epr_sock.recv_keep()[0]
+                yield from conn.flush()
+
+                # Round B: receive role signal
+                signal = yield from csock.recv()
+                yield from conn.flush()
+
+                if signal == "skip" or self.qubit_roles[r_loc][c_loc] != "pQ":
+                    eB.measure()
+                    yield from conn.flush()
+                    csock.send("0")
+                    continue
+
+                data = self.local_qubits[r_loc][c_loc]
+
+                # Round C: Apply teleported parity gate and measure eB.
+                data.cnot(eB)
+
+                m_B = eB.measure()
+                # Flush to ensure measurement result is available before conversion
+                yield from conn.flush()
+
+                # Round D: send m_B to ancilla side
+                csock.send(str(int(m_B)))
+
+        return xor_bits
+
+    # Step 5 — SVD payload
+    def _build_local_system(self) -> tuple:
+        #Build local H matrix and syndrome vector for this node.
+        
+        B = self.layout_manager.block_size
+        r_node, c_node = self.node_coords
+        d_pos, a_pos = [], []
+        
+        # Identify qubits and their global positions
+        for r in range(B):
+            for c in range(B):
+                # Convert local to global coordinates
+                gr, gc = r_node * B + r, c_node * B + c
+                role = self.qubit_roles[r][c]
+                if role == "pQ":
+                    d_pos.append((gr, gc))
+                elif role in ("xQ", "zQ"):
+                    a_pos.append((gr, gc))
+        
+        # Build H matrix: entries are 1 when ancilla and data are neighbors
+        H = np.zeros((len(a_pos), len(d_pos)), dtype=float)
+        for i, (ar, ac) in enumerate(a_pos):
+            for j, (dr, dc) in enumerate(d_pos):
+                if abs(ar - dr) + abs(ac - dc) == 1:
+                    H[i, j] = 1.0
+        
+        # Build syndrome vector from ancilla measurements in local coordinates
+        s = np.array([self.ancilla_measurements.get((p[0] % B, p[1] % B), 0) 
+                      for p in a_pos], dtype=int)
+        return H, s, d_pos
+
+    def _build_svd_payload(self, energy_threshold: float = None) -> dict:
+        if energy_threshold is None:
+            energy_threshold = self.ENERGY_THRESHOLD
+        
+        H, s, data_pos = self._build_local_system()
+
+        # 1. Early exit: if no syndrome, node doesn't participate in global correction
+        if H.size == 0 or not np.any(s):
+            return {
+                "active": False, 
+                "node_id": list(self.node_coords),
+                "data_positions": [list(p) for p in data_pos]
+            }
+
+        # 2. Compute SVD and determine compression rank
+        r_node, c_node = self.node_coords
+        B = self.layout_manager.block_size
+        n = H.shape[1]
+        
+        U, sigma, Vt = np.linalg.svd(H, full_matrices=False)
+
+        # Determine rank k based on energy threshold
+        total_energy = np.sum(sigma ** 2)
+        k = n
+        if total_energy > 1e-10:
+            cumulative = np.cumsum(sigma ** 2)
+            k = int(np.searchsorted(cumulative, energy_threshold * total_energy) + 1)
+            k = min(k, n)
+
+        # Apply SVD compression if beneficial
+        if k < n:
+            H_reduced = U[:, :k] * sigma[:k]
+            V_k = Vt[:k, :].T
+        else:
+            # No compression: send H directly with identity projection
+            H_reduced = H
+            V_k = np.eye(n)
+
+        return {
+            "active":         True,
+            "node_id":        list(self.node_coords),
+            "H_reduced":      H_reduced.tolist(),
+            "V_k":            V_k.tolist(),
+            "s":              s.tolist(),
+            "k":              k,
+            "data_positions": [list(p) for p in data_pos],
+            "global_offset":  [r_node * B, c_node * B],
+        }
+
+    def _communicate_with_coordinator(self, context, payload: dict) -> dict:
+        csock = context.csockets[self.coordinator_name]
+        csock.send(json.dumps(payload))
+        yield from context.connection.flush()
+        msg = yield from csock.recv()
+        return json.loads(msg)
+
+    def _apply_corrections(self, corrections: list):
+        """Apply corrections from coordinator in global coordinates.
+        
+        Filters corrections to those within this node's block and converts
+        from global to local coordinates before applying X corrections.
+        """
+        r_node, c_node = self.node_coords
+        B = self.layout_manager.block_size
+        
+        # Calculate this node's global coordinate boundaries
+        r_start = r_node * B
+        r_end = (r_node + 1) * B
+        c_start = c_node * B
+        c_end = (c_node + 1) * B
+
+        for r_global, c_global in corrections:
+            # Check if correction is within this node's block
+            if r_start <= r_global < r_end and c_start <= c_global < c_end:
+                # Convert to local coordinates
+                r_local = r_global - r_start
+                c_local = c_global - c_start
+                
+                # Apply correction only to data qubits (pQ)
+                if self.qubit_roles[r_local][c_local] == "pQ":
+                    key = (r_local, c_local)
+                    self.applied_corrections.add(key)
+
+    # Step 6 — Logical-Z parity
+
+    def _send_logical_parity(self, context) -> None:
+        """Send logical-Z parity to coordinator.
+        
+        Only the left-column node (c_node == 0) computes and sends the actual
+        parity. Other nodes send -1 placeholder to maintain synchronization.
+        """
+        csock = context.csockets[self.coordinator_name]
+        r_node, c_node = self.node_coords
+        B = self.layout_manager.block_size
+
+        if c_node != 0:
+            # Non-boundary node: send placeholder
+            csock.send(json.dumps(-1))
+        else:
+            # Boundary node: compute parity from left column
+            parity = 0
+            for r in range(B):
+                if self.qubit_roles[r][0] == "pQ":
+                    # XOR with injected error and applied corrections
+                    parity ^= int((r, 0) in self.injected_errors)
+                    parity ^= int((r, 0) in self.applied_corrections)
+            csock.send(json.dumps(parity))
+
+        yield from context.connection.flush()
