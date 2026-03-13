@@ -8,16 +8,16 @@ from netsquid_netbuilder.modules.clinks.default import DefaultCLinkConfig
 from surface_code import SurfaceLayout
 from dis_surface_code import ClusterNodeProgram
 from coordinator import CoordinatorProgram
-
+#from dis_sufarce_code_debug import ClusterNodeProgram
 
 def main():
     global_size    = 4   # planar surface code with 10x10 qubits (100 qubits total)
     nodes_per_side = 2   # 2x2 grid of nodes, each node manages a 5x5 subgrid
 
-    # 1. Create the Surface Layout Manager
+    # Step 1: Create the Surface Layout Manager
     layout_manager = SurfaceLayout(global_size, nodes_per_side)
 
-    # 2. Define node names: cluster nodes + coordinator
+    # Step 2: Define node names - cluster nodes + coordinator
     cluster_node_names = []
     for r in range(nodes_per_side):
         for c in range(nodes_per_side):
@@ -26,7 +26,7 @@ def main():
     coordinator_name = "coordinator"
     all_node_names   = cluster_node_names + [coordinator_name]
 
-    # 3. Configure the network (complete graph: every node can reach every other)
+    # Step 3: Configure the network (complete graph: every node can reach every other)
     cfg = create_complete_graph_network(
         node_names=all_node_names,
         link_typ="perfect",
@@ -35,7 +35,7 @@ def main():
         clink_cfg=DefaultCLinkConfig(delay=0),
     )
 
-    # 4. Create programs for each cluster node and for the coordinator
+    # Step 4: Create programs for each cluster node and coordinator
     programs = {}
 
     for r in range(nodes_per_side):
@@ -51,7 +51,7 @@ def main():
         layout_manager=layout_manager,
     )
 
-    # 5. Run the simulation
+    # Step 5: Run the simulation
     print("Running Distributed Surface Code simulation...")
     print(f"Global grid   : {global_size}x{global_size} qubits")
     print(f"Cluster nodes : {len(cluster_node_names)} nodes "
