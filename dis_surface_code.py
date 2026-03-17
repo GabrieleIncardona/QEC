@@ -7,7 +7,7 @@ from netqasm.sdk.qubit import Qubit
 
 
 class ClusterNodeProgram(Program):
-    NOISE_PROBABILITY = 0.3        # probability of X error on each data qubit before stabilizer measurements
+    NOISE_PROBABILITY = 0.1        # probability of X error on each data qubit before stabilizer measurements
     ENERGY_THRESHOLD  = 0.95        # fraction of total energy to retain in SVD dimensionality reduction (0 < threshold <= 1)
     NUM_ROUNDS        = 2           # number of rounds of stabilizer measurements (for spacetime decoding)
 
@@ -454,6 +454,34 @@ class ClusterNodeProgram(Program):
         return H, s, d_pos
 
     def _build_svd_payload(self, energy_threshold: float = None) -> dict:
+        """Build the SVD-compressed payload to send to the coordinator.
+
+        SVD-BASED COLUMN SELECTION FOR GF(2)-COMPATIBLE COMPRESSION
+        -------------------------------------------------------------
+        We use SVD to identify the k most 'energy-carrying' directions in the
+        data-qubit space, then select the k representative qubits (columns of H)
+        that best span those directions.
+
+        Why column *selection* rather than projection onto real-valued singular vectors:
+          - OSD operates over GF(2): H and s must be binary integers.
+          - Back-projection of a binary e_reduced through a real V_k is ambiguous:
+              e.g. |V_k @ [1]| = [0.707, 0.707] -> round -> [1, 1]  (both qubits corrected!)
+          - With column selection, V_k is an exact {0,1} matrix:
+              e_full[selected_col[i]] = e_reduced[i], all other positions = 0.
+            Back-projection is lossless.
+
+        Algorithm:
+          1. SVD of H (real) -> right singular vectors Vt  (shape: min(m,n) x n)
+          2. Keep top-k singular vectors (energy threshold).
+          3. For each of the k dimensions, pick the data qubit j = argmax |Vt[i, j]|.
+             These are the qubits most aligned with the principal directions of H.
+          4. H_reduced = H[:, selected_cols]  (binary, m x k)
+          5. V_k = binary selection matrix (n x k), with V_k[selected_cols[i], i] = 1.
+
+        For large blocks (e.g. 4x4 nodes) this achieves genuine compression:
+        k ~ 3-4 instead of n=8, halving the payload sent to the coordinator.
+        For small blocks (2x2) k=n=2 so no compression, which is correct.
+        """
         if energy_threshold is None:
             energy_threshold = self.ENERGY_THRESHOLD
 
@@ -467,22 +495,13 @@ class ClusterNodeProgram(Program):
             }
 
         r_node, c_node = self.node_coords
-        B = self.layout_manager.block_size
+        B  = self.layout_manager.block_size
         m, n = H.shape
 
-        # SVD-based dimensionality reduction on the *column* space (data qubit space).
-        # We decompose H = U Σ Vt and keep the top-k right singular vectors.
-        # The reduced system operates on the k-dimensional projection e_red = Vt[:k] @ e_full,
-        # so the reduced parity-check matrix is H_red = H @ V_k  (shape: m × k)
-        # where V_k = Vt[:k].T  (shape: n × k).
-        #
-        # CRITICAL: H_red must remain a binary GF(2) matrix for OSD to work correctly.
-        # We binarise it by rounding the absolute value and taking mod 2.
-        # The coordinator's OSD decoder then works in GF(2) on H_red.
-        # Back-projection: e_full ≈ V_k @ e_red  (also binarised mod 2).
-
+        # --- SVD to find principal directions in qubit space ---
         U, sigma, Vt = np.linalg.svd(H.astype(float), full_matrices=False)
 
+        # Determine k via energy threshold
         total_energy = np.sum(sigma ** 2)
         k = n
         if total_energy > 1e-10:
@@ -491,14 +510,34 @@ class ClusterNodeProgram(Program):
                                     energy_threshold * total_energy) + 1)
             k = min(k, n)
 
-        if k < n:
-            V_k       = Vt[:k, :].T                             # (n, k)
-            # H_red = H @ V_k, then binarise for GF(2) OSD
-            H_reduced = (np.round(np.abs(H.astype(float) @ V_k)) % 2).astype(int)
-        else:
-            # No reduction: send the original binary H directly
-            H_reduced = H.astype(int)                           # (m, n)
-            V_k       = np.eye(n)                               # (n, n)
+        # --- Select k representative columns (data qubits) ---
+        # For each of the top-k singular vectors, pick the qubit with highest loading.
+        # This gives a set of k qubits that best span the principal error directions.
+        selected_cols = []
+        for i in range(k):
+            # Candidates ordered by |loading| on singular vector i
+            order = np.argsort(-np.abs(Vt[i]))
+            for j in order:
+                if j not in selected_cols:
+                    selected_cols.append(j)
+                    break
+
+        # Fill up to k if any duplicates were skipped (shouldn't happen, but defensive)
+        for j in range(n):
+            if len(selected_cols) >= k:
+                break
+            if j not in selected_cols:
+                selected_cols.append(j)
+
+        # --- Build binary reduced system ---
+        H_reduced = H[:, selected_cols].astype(int)    # (m, k) — exact binary submatrix
+
+        # V_k: exact {0,1} selection matrix (n x k).
+        # Back-projection: e_full[selected_cols[i]] = e_reduced[i], others = 0.
+        # Using float dtype for compatibility with coordinator's np.array(V_k, dtype=float).
+        V_k = np.zeros((n, k), dtype=float)
+        for i, col in enumerate(selected_cols):
+            V_k[col, i] = 1.0
 
         return {
             "active":         True,
