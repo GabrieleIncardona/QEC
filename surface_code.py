@@ -22,6 +22,7 @@ class SurfaceLayout:
         Returns:
             List of lists containing qubit details with keys:
             - 'role': Qubit type ("pQ" for data, "xQ"/"zQ" for ancilla)
+            - xQ is used for X stabilizers, zQ for Z stabilizers, arranged in a checkerboard pattern
             - 'is_border': Whether qubit is on subgrid boundary
             - 'global_pos': Global (row, col) coordinate
         """
