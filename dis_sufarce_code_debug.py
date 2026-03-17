@@ -7,7 +7,7 @@ from netqasm.sdk.qubit import Qubit
 
 
 class ClusterNodeProgram(Program):
-    NOISE_PROBABILITY = 1.0        # probability of X error on each data qubit before stabilizer measurements
+    NOISE_PROBABILITY = 0.3        # probability of X error on each data qubit before stabilizer measurements
     ENERGY_THRESHOLD  = 0.95        # fraction of total energy to retain in SVD dimensionality reduction (0 < threshold <= 1)
     NUM_ROUNDS        = 2           # number of rounds of stabilizer measurements (for spacetime decoding)
 
@@ -33,7 +33,7 @@ class ClusterNodeProgram(Program):
             name = f"node_{self.node_coords[0]}_{self.node_coords[1]}",
             csockets = self.neighbors + [self.coordinator_name],
             epr_sockets = self.neighbors,
-            max_qubits  = B * B + B,    # Max qubits: all physical qubits (B²) + EPR qubits on one border (B) for TeleGate protocol
+            max_qubits  = B * B + B,    # Max qubits needed: all phisical qubits (B^2) + all epr qubit on one border (B) for TeleGate protocol
         )
 
     # ------------------------------------------------------------------ #
@@ -99,14 +99,12 @@ class ClusterNodeProgram(Program):
             for r in range(B):
                 for c in range(B):
                     role = self.qubit_roles[r][c]
-                    if role not in ("xQ", "zQ"):
-                        # Only ancillas participate in local gates; data qubits are idle
-                        # (except Z gates from TeleGate border protocol, handled separately and tracked in z_parity)
+                    if role not in ("xQ", "zQ"):        # Only ancillas participate in local gates; data qubits are idle (except for Z gates from TeleGate border protocol, which are handled separately and tracked in z_parity)
                         continue
                     ancilla = self.local_qubits[r][c]
                     if role == "xQ":
-                        ancilla.H()  # Prepare xQ ancillas in |+⟩ state for X parity measurement
-                    for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:  # Local CNOTs with neighboring data qubits
+                        ancilla.H()                     # Prepare xQ ancillas in |+⟩ for X parity measurement    
+                    for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:       # local CNOT with neighboring data qubits
                         nr, nc = r + dr, c + dc
                         if (0 <= nr < B and 0 <= nc < B
                                 and self.qubit_roles[nr][nc] == "pQ"):
@@ -162,24 +160,15 @@ class ClusterNodeProgram(Program):
             print(f"[{self.node_coords}] Round {round_idx + 1} syndrome: "
                   f"{active if active else 'clean'}")
 
-        # ── 4. Spacetime decoding: Calculation of all detection events ──────────
-        self.detection_events = []  # List storing detection event dictionaries for each round
-        
-        # Create a virtual "Round 0" where all syndromes are 0
-        previous_syndrome = {pos: 0 for pos in all_round_syndromes[0]}
-        
-        for round_idx, current_syndrome in enumerate(all_round_syndromes):
-            # E_t = s_t XOR s_{t-1}
-            diff = {pos: current_syndrome[pos] ^ previous_syndrome[pos] for pos in current_syndrome}
-            self.detection_events.append(diff)
-            
-            # Prepare previous_syndrome for the next iteration
-            previous_syndrome = current_syndrome
-            
-            # Debug printout
-            active = {k: v for k, v in diff.items() if v == 1}
-            print(f"[{self.node_coords}] Detection events Round {round_idx + 1}: "
-                  f"{active if active else 'clean'}")
+        # ── 4. Spacetime decoding: XOR between two rounds ──────────────────
+        s1 = all_round_syndromes[0]
+        s2 = all_round_syndromes[1]
+        self.ancilla_measurements = {pos: s1[pos] ^ s2[pos] for pos in s1}
+        #self.ancilla_measurements = s1  # For NUM_ROUNDS=1, just use the single round syndrome without XOR
+
+        active_final = {k: v for k, v in self.ancilla_measurements.items() if v == 1}
+        print(f"[{self.node_coords}] Spacetime syndrome (XOR): "
+              f"{active_final if active_final else 'clean'}")
 
         # ── 5. SVD payload and corrections ────────────────────────────────
         payload = self._build_svd_payload()
@@ -384,9 +373,33 @@ class ClusterNodeProgram(Program):
     #  SVD payload                                                         #
     # ------------------------------------------------------------------ #
     def _build_local_system(self) -> tuple:
-        B = self.layout_manager.block_size
+        """Build the parity-check system for this node.
+
+        Returns H, s, d_pos where:
+          - H  : binary parity-check matrix, shape (num_ancilla, num_data)
+          - s  : syndrome vector, shape (num_ancilla,)
+          - d_pos : list of global (row, col) positions of data qubits
+
+        KEY DESIGN DECISION — separate xQ and zQ rows:
+        -----------------------------------------------
+        xQ ancillas implement X stabilizers and detect *Z* errors.
+        zQ ancillas implement Z stabilizers and detect *X* errors.
+        Mixing them into a single H causes rank deficiency in small blocks
+        (e.g. in a 2×2 node the xQ and zQ adjacency rows are identical,
+        so the combined H has rank 1 while a mixed syndrome like s=[0,1]
+        is inconsistent → OSD returns e=0 and no correction is applied).
+
+        We therefore build H_Z (zQ rows) and H_X (xQ rows) separately and
+        stack only the rows that have at least one non-zero syndrome entry,
+        preferring the set that is self-consistent.  If both are active we
+        stack them; the coordinator's GF(2) OSD handles the joint system
+        correctly because xQ and zQ never share a column after elimination.
+        """
+        B        = self.layout_manager.block_size
         r_node, c_node = self.node_coords
-        d_pos, a_pos = [], []
+        d_pos    = []
+        zq_pos   = []   # positions of zQ ancillas (detect X errors)
+        xq_pos   = []   # positions of xQ ancillas (detect Z errors)
 
         for r in range(B):
             for c in range(B):
@@ -394,26 +407,49 @@ class ClusterNodeProgram(Program):
                 role   = self.qubit_roles[r][c]
                 if role == "pQ":
                     d_pos.append((gr, gc))
-                elif role in ("xQ", "zQ"):
-                    a_pos.append((gr, gc))
+                elif role == "zQ":
+                    zq_pos.append((gr, gc))
+                elif role == "xQ":
+                    xq_pos.append((gr, gc))
 
-        H = np.zeros((len(a_pos), len(d_pos)), dtype=float)
-        for i, (ar, ac) in enumerate(a_pos):
-            for j, (dr, dc) in enumerate(d_pos):
-                if abs(ar - dr) + abs(ac - dc) == 1:
-                    H[i, j] = 1.0
+        n = len(d_pos)
 
-        # ---- SPACETIME SYNDROME HISTORY MODIFICATION ----
-        # Build the history of syndromes in time
-        s_history = []
-        for events_dict in self.detection_events:
-            # Extract the measurements for this specific round
-            s_t = [events_dict.get((p[0] % B, p[1] % B), 0) for p in a_pos]
-            s_history.append(s_t)
+        def _make_H_and_s(anc_pos):
+            """Build (H_block, s_block) for a list of ancilla positions."""
+            H_block = np.zeros((len(anc_pos), n), dtype=int)
+            for i, (ar, ac) in enumerate(anc_pos):
+                for j, (dr, dc) in enumerate(d_pos):
+                    if abs(ar - dr) + abs(ac - dc) == 1:
+                        H_block[i, j] = 1
+            s_block = np.array(
+                [self.ancilla_measurements.get((p[0] % B, p[1] % B), 0)
+                 for p in anc_pos],
+                dtype=int,
+            )
+            return H_block, s_block
 
-        # s is now a 2D matrix of shape (NUM_ROUNDS, len(a_pos))
-        s = np.array(s_history, dtype=int) 
-        # ------------------------------------------------
+        H_Z, s_Z = _make_H_and_s(zq_pos)   # Z stabilizers → X error detection
+        H_X, s_X = _make_H_and_s(xq_pos)   # X stabilizers → Z error detection
+
+        # Only include rows whose syndrome is actually non-trivial, to avoid
+        # inflating the system with inconsistent zero-syndrome / dependent rows.
+        active_Z = np.any(s_Z)
+        active_X = np.any(s_X)
+
+        if active_Z and active_X:
+            H = np.vstack([H_Z, H_X])
+            s = np.concatenate([s_Z, s_X])
+        elif active_Z:
+            H = H_Z
+            s = s_Z
+        elif active_X:
+            H = H_X
+            s = s_X
+        else:
+            # No active syndrome: return full H (both blocks) with zero syndrome
+            # so the coordinator gets the correct structure even if inactive.
+            H = np.vstack([H_Z, H_X]) if (len(zq_pos) + len(xq_pos)) > 0 else np.zeros((0, n), dtype=int)
+            s = np.zeros(H.shape[0], dtype=int)
 
         return H, s, d_pos
 
@@ -423,8 +459,6 @@ class ClusterNodeProgram(Program):
 
         H, s, data_pos = self._build_local_system()
 
-        # np.any(s) works perfectly even if s is a 2D matrix.
-        # Returns False only if ALL bits in ALL rounds are 0.
         if H.size == 0 or not np.any(s):
             return {
                 "active":         False,
@@ -434,10 +468,20 @@ class ClusterNodeProgram(Program):
 
         r_node, c_node = self.node_coords
         B = self.layout_manager.block_size
-        n = H.shape[1]
+        m, n = H.shape
 
-        # SVD is purely spatial and remains unchanged!
-        U, sigma, Vt = np.linalg.svd(H, full_matrices=False)
+        # SVD-based dimensionality reduction on the *column* space (data qubit space).
+        # We decompose H = U Σ Vt and keep the top-k right singular vectors.
+        # The reduced system operates on the k-dimensional projection e_red = Vt[:k] @ e_full,
+        # so the reduced parity-check matrix is H_red = H @ V_k  (shape: m × k)
+        # where V_k = Vt[:k].T  (shape: n × k).
+        #
+        # CRITICAL: H_red must remain a binary GF(2) matrix for OSD to work correctly.
+        # We binarise it by rounding the absolute value and taking mod 2.
+        # The coordinator's OSD decoder then works in GF(2) on H_red.
+        # Back-projection: e_full ≈ V_k @ e_red  (also binarised mod 2).
+
+        U, sigma, Vt = np.linalg.svd(H.astype(float), full_matrices=False)
 
         total_energy = np.sum(sigma ** 2)
         k = n
@@ -448,18 +492,20 @@ class ClusterNodeProgram(Program):
             k = min(k, n)
 
         if k < n:
-            H_reduced = U[:, :k] * sigma[:k]
-            V_k       = Vt[:k, :].T
+            V_k       = Vt[:k, :].T                             # (n, k)
+            # H_red = H @ V_k, then binarise for GF(2) OSD
+            H_reduced = (np.round(np.abs(H.astype(float) @ V_k)) % 2).astype(int)
         else:
-            H_reduced = H
-            V_k       = np.eye(n)
+            # No reduction: send the original binary H directly
+            H_reduced = H.astype(int)                           # (m, n)
+            V_k       = np.eye(n)                               # (n, n)
 
         return {
             "active":         True,
             "node_id":        list(self.node_coords),
             "H_reduced":      H_reduced.tolist(),
             "V_k":            V_k.tolist(),
-            "s":              s.tolist(),  # Produces a 2D list [[round1_bits], [round2_bits], ...] suitable for JSON 
+            "s":              s.tolist(),
             "k":              k,
             "data_positions": [list(p) for p in data_pos],
             "global_offset":  [r_node * B, c_node * B],
@@ -483,7 +529,7 @@ class ClusterNodeProgram(Program):
                 r_local = r_global - r_start
                 c_local = c_global - c_start
                 if self.qubit_roles[r_local][c_local] == "pQ":
-                    self.local_qubits[r_local][c_local].X()  # Apply X correction (bit-flip)
+                    self.local_qubits[r_local][c_local].X()
                     self.applied_corrections.add((r_local, c_local))
 
     # ------------------------------------------------------------------ #

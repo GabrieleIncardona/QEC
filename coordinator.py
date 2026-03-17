@@ -74,54 +74,28 @@ class CoordinatorProgram(Program):
         H_blocks, s_list, registry = [], [], []
         col_offset = 0
 
-        # Assumiamo che tutti i nodi abbiano lo stesso numero di round
-        num_rounds = len(active[0]["s"]) 
-        num_ancillas_total = sum(np.array(p["H_reduced"]).shape[0] for p in active)
-
         for p in active:
-            H_red = np.array(p["H_reduced"]) 
-            V_k = np.array(p["V_k"])
-            # s_i è ora [[r1_bits], [r2_bits]]
-            s_i_matrix = np.array(p["s"], dtype=int) 
+            H_red = np.array(p["H_reduced"])   # (m_i, k_i)
+            V_k = np.array(p["V_k"])          # (n_i, k_i)
+            s_i = np.array(p["s"], dtype=int)
             k_i = int(p["k"])
 
             H_blocks.append(H_red)
-            # Appiattiamo lo storico delle sindromi: [round1_all_nodes, round2_all_nodes]
-            # Ma dobbiamo farlo con attenzione dopo il block_diag
-            
+            s_list.extend(s_i.tolist())
+
             registry.append({
-                "node_id": tuple(p["node_id"]),
-                "V_k": V_k,
+                "node_id":        tuple(p["node_id"]),
+                "V_k":            V_k,
                 "data_positions": [tuple(pos) for pos in p["data_positions"]],
-                "col_start": col_offset,
-                "col_end": col_offset + k_i,
-                "s_raw": s_i_matrix # Salviamo la matrice intera
+                "col_start":      col_offset,
+                "col_end":        col_offset + k_i,
             })
             col_offset += k_i
 
-        # Matrice spaziale base
-        H_space = block_diag(*H_blocks)
-        
-        # --- COSTRUZIONE MATRICE SPAZIOTEMPORALE ---
-        # Se abbiamo T round e M ancille, la nuova H sarà (T*M) x (T*K + (T-1)*M)
-        # Per semplicità, creiamo una versione che decodifica i data qubit 
-        # considerando la persistenza degli errori.
-        
-        T = num_rounds
-        M, K = H_space.shape
-        
-        # H_global sarà una matrice a blocchi dove H_space si ripete sulla diagonale
-        # e le identità collegano i round per gli errori di misura
-        H_global = block_diag(*[H_space for _ in range(T)])
-        
-        # Costruiamo s_global concatenando i round: [s1_node1, s1_node2, ..., s2_node1, ...]
-        s_final = []
-        for t in range(T):
-            for reg in registry:
-                s_final.extend(reg["s_raw"][t].tolist())
-        s_global = np.array(s_final, dtype=int)
+        H_global = block_diag(*H_blocks)        # Block-diagonal global parity-check matrix
+        s_global = np.array(s_list, dtype=int)  # Global syndrome vector
+        return H_global, s_global, registry     # Return registry for back-projection of corrections
 
-        return H_global, s_global, registry
     # Step 3 — OSD over GF(2)
     def _osd_gf2(self, H_global: np.ndarray, s_global: np.ndarray, osd_order: int = 2) -> np.ndarray:
         m, K_tot = H_global.shape
@@ -184,20 +158,14 @@ class CoordinatorProgram(Program):
     # Step 4 — Back-project global error to per-node corrections
     def _project_corrections(self, e_global: np.ndarray, registry: list) -> dict:
         corrections = {}
-        K_tot_space = registry[-1]["col_end"] 
-        
         for reg in registry:
-            e_accumulated = np.zeros(reg["col_end"] - reg["col_start"], dtype=int)
-            
-            # Partiamo da t=1 per ignorare le parità iniziali del setup
-            # e considerare solo il rumore iniettato tra Round 1 e Round 2
-            for t in range(1, len(reg["s_raw"])): 
-                start = t * K_tot_space + reg["col_start"]
-                end = t * K_tot_space + reg["col_end"]
-                e_accumulated = (e_accumulated + e_global[start:end]) % 2
-            
-            V_k = reg["V_k"]
-            e_local = (np.round(np.abs(V_k @ e_accumulated)) % 2).astype(int)
+            e_block = e_global[reg["col_start"]:reg["col_end"]]   # shape (k,)
+            V_k     = reg["V_k"]                                   # shape (n, k)
+
+            # Back-project from reduced space to full data-qubit space and binarise.
+            # V_k @ e_block maps the k-dimensional correction back to n data qubits.
+            # We round the absolute value and take mod 2 to recover a GF(2) vector.
+            e_local = (np.round(np.abs(np.array(V_k, dtype=float) @ e_block.astype(float))) % 2).astype(int)
 
             corrections[reg["node_id"]] = [
                 list(reg["data_positions"][j])
