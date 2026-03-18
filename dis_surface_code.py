@@ -59,7 +59,7 @@ class ClusterNodeProgram(Program):
 
         # ── 3. Two rounds of stabilizer measurements ──────────────────────
         # The gate data.Z() is applied to data qubits on the border during
-        # Cat-DisEnt zQ — this is correct and necessary for the protocol.
+        # Cat-DisEnt zQ.
         #
         # Spacetime decoding with classical feedback compensation:
         #   Between round 1 and round 2, Z gates accumulated on data qubits
@@ -77,7 +77,7 @@ class ClusterNodeProgram(Program):
         all_round_syndromes = []
 
         for round_idx in range(self.NUM_ROUNDS):
-
+            # Apply noise only before the first round, so that the second round's syndrome reflects the effect of noise + any Z gates from TeleGate.
             if round_idx == 1:
                 # 2. Apply noise
                 for r in range(B):
@@ -89,7 +89,7 @@ class ClusterNodeProgram(Program):
                 print(f"[{self.node_coords}] Noise: "
                 f"{len(self.injected_errors) if self.injected_errors else 'none'}")
 
-            # a) Re-allocate ancillas (data qubits unchanged)
+            # a) Re-allocate ancillas
             for r in range(B):
                 for c in range(B):
                     if self.qubit_roles[r][c] in ("xQ", "zQ"):
@@ -152,7 +152,7 @@ class ClusterNodeProgram(Program):
                                 z_flip ^= 1
                         round_syndrome[(r, c)] = raw ^ z_flip
                     else:
-                        # zQ measures in Z basis: Z commutes with Z → no compensation
+                        # zQ measures Z parity, which is unaffected by Z gates on data qubits (commutes), so no compensation needed.
                         round_syndrome[(r, c)] = raw
 
             all_round_syndromes.append(round_syndrome)
@@ -166,6 +166,7 @@ class ClusterNodeProgram(Program):
         self.ancilla_measurements = {pos: s1[pos] ^ s2[pos] for pos in s1}
         #self.ancilla_measurements = s1  # For NUM_ROUNDS=1, just use the single round syndrome without XOR
 
+        # Print the final spacetime syndrome after XOR. Active syndromes indicate potential error locations that the coordinator will use for decoding.
         active_final = {k: v for k, v in self.ancilla_measurements.items() if v == 1}
         print(f"[{self.node_coords}] Spacetime syndrome (XOR): "
               f"{active_final if active_final else 'clean'}")
@@ -189,53 +190,82 @@ class ClusterNodeProgram(Program):
     # ------------------------------------------------------------------ #
     def _teleported_cnot_borders(self, context):
         """
-        Returns round_z: set of (r_loc, c_loc) coordinates of local data qubits
-        that received data.Z() an odd number of times this round.
+        Execute TeleGate protocol for all borders of this node, in a globally
+        canonical order to prevent deadlock in NxN grids.
+
+        DEADLOCK ROOT CAUSE
+        -------------------
+        The original order (right, left, down, up) makes different nodes process
+        their borders in incompatible sequences. In a 3x3 grid this creates circular
+        waits: A waits for B which waits for C which waits for A.
+
+        FIX: canonical global border ordering
+        --------------------------------------
+        All nodes process borders in the same global order:
+          Phase 1 — horizontal links (col direction), row by row, left to right:
+            (r,0)-(r,1), (r,1)-(r,2), ..., for r = 0..N-1
+          Phase 2 — vertical links (row direction), column by column, top to bottom:
+            (0,c)-(1,c), (1,c)-(2,c), ..., for c = 0..N-1
+
+        For each link, the node with the SMALLER coordinate is always ancilla_side=True
+        (calls create_keep). The node with the larger coordinate is always False (recv_keep).
+        Since every node processes links in the same global order, both sides of each
+        EPR link are always ready at the same step — no circular waits possible.
+
+        Returns round_z: set of (r_loc, c_loc) of data qubits that received Z() this round.
         """
         r_node, c_node = self.node_coords
         N = self.layout_manager.nodes_per_side
         B = self.layout_manager.block_size
         round_z = set()
 
-        if c_node < N - 1:
-            z_set = yield from self._run_border_direction(
-                context,
-                neighbor        = f"node_{r_node}_{c_node + 1}",
-                is_ancilla_side = True,
-                axis            = "col",
-                local_fixed     = B - 1,
-            )
-            round_z ^= z_set
+        # ── Phase 1: horizontal links (between left/right neighbors) ──────────
+        # Process in order: column c=0..N-2, for each column all rows r=0..N-1
+        for c in range(N - 1):
+            # Link between (r_node, c) and (r_node, c+1)
+            if c_node == c:          # this node is the LEFT side → ancilla_side=True
+                z_set = yield from self._run_border_direction(
+                    context,
+                    neighbor = f"node_{r_node}_{c_node + 1}",
+                    is_ancilla_side = True,
+                    axis  = "col",
+                    local_fixed = B - 1,   # rightmost column of this node
+                )
+                round_z ^= z_set
+            elif c_node == c + 1:    # this node is the RIGHT side → ancilla_side=False
+                z_set = yield from self._run_border_direction(
+                    context,
+                    neighbor = f"node_{r_node}_{c_node - 1}",
+                    is_ancilla_side = False,
+                    axis = "col",
+                    local_fixed = 0,        # leftmost column of this node
+                )
+                round_z ^= z_set
+            # else: this node is not part of this link, skip
 
-        if c_node > 0:
-            z_set = yield from self._run_border_direction(
-                context,
-                neighbor        = f"node_{r_node}_{c_node - 1}",
-                is_ancilla_side = False,
-                axis            = "col",
-                local_fixed     = 0,
-            )
-            round_z ^= z_set
-
-        if r_node < N - 1:
-            z_set = yield from self._run_border_direction(
-                context,
-                neighbor        = f"node_{r_node + 1}_{c_node}",
-                is_ancilla_side = True,
-                axis            = "row",
-                local_fixed     = B - 1,
-            )
-            round_z ^= z_set
-
-        if r_node > 0:
-            z_set = yield from self._run_border_direction(
-                context,
-                neighbor        = f"node_{r_node - 1}_{c_node}",
-                is_ancilla_side = False,
-                axis            = "row",
-                local_fixed     = 0,
-            )
-            round_z ^= z_set
+        # ── Phase 2: vertical links (between top/bottom neighbors) ────────────
+        # Process in order: row r=0..N-2, for each row all columns c=0..N-1
+        for r in range(N - 1):
+            # Link between (r, c_node) and (r+1, c_node)
+            if r_node == r:          # this node is the TOP side → ancilla_side=True
+                z_set = yield from self._run_border_direction(
+                    context,
+                    neighbor        = f"node_{r_node + 1}_{c_node}",
+                    is_ancilla_side = True,
+                    axis            = "row",
+                    local_fixed     = B - 1,   # bottom row of this node
+                )
+                round_z ^= z_set
+            elif r_node == r + 1:    # this node is the BOTTOM side → ancilla_side=False
+                z_set = yield from self._run_border_direction(
+                    context,
+                    neighbor        = f"node_{r_node - 1}_{c_node}",
+                    is_ancilla_side = False,
+                    axis            = "row",
+                    local_fixed     = 0,        # top row of this node
+                )
+                round_z ^= z_set
+            # else: not part of this link, skip
 
         return round_z
 
@@ -274,17 +304,18 @@ class ClusterNodeProgram(Program):
 
             if is_ancilla_side:
                 anc_role = self.qubit_roles[r_loc][c_loc]
-
-                # Check if there is a remote adjacent data qubit in this direction.
-                # The remote data qubit is on the opposite border of the neighboring node,
-                # at the same position along the border (same idx).
-                # For axis=col: the remote neighbor is in the horizontal direction,
-                #   so the remote data qubit is adjacent only if anc_role=="xQ"
-                #   (xQ measures X parity with left/right neighbors).
-                # For axis=row: the remote neighbor is in the vertical direction,
-                #   so the remote data qubit is adjacent only if anc_role=="zQ"
-                #   (zQ measures Z parity with up/down neighbors).
-                # If the ancilla has no remote neighbors in the correct direction → skip.
+                """
+                Check if there is a remote adjacent data qubit in this direction.
+                The remote data qubit is on the opposite border of the neighboring node,
+                at the same position along the border (same idx).
+                For axis=col: the remote neighbor is in the horizontal direction,
+                  so the remote data qubit is adjacent only if anc_role=="xQ"
+                  (xQ measures X parity with left/right neighbors).
+                For axis=row: the remote neighbor is in the vertical direction,
+                  so the remote data qubit is adjacent only if anc_role=="zQ"
+                  (zQ measures Z parity with up/down neighbors).
+                If the ancilla has no remote neighbors in the correct direction → skip.
+                """
                 if anc_role == "xQ" and axis == "row":
                     role_signal = "skip"  # xQ has no vertical remote neighbors
                 elif anc_role == "zQ" and axis == "col":
@@ -305,6 +336,8 @@ class ClusterNodeProgram(Program):
                     yield from conn.flush()
                     yield from csock.recv()
                     continue
+
+                #eA = epr_sock.create_keep()[0]
 
                 if role_signal == "xQ":
                     ancilla.cnot(eA)
@@ -338,7 +371,8 @@ class ClusterNodeProgram(Program):
                     csock.send("0")
                     yield from conn.flush()
                     continue
-
+                
+                #eB = epr_sock.recv_keep()[0]
                 data = self.local_qubits[r_loc][c_loc]
 
                 if signal == "xQ":
@@ -376,34 +410,29 @@ class ClusterNodeProgram(Program):
         """Build the parity-check system for this node.
 
         Returns H, s, d_pos where:
-          - H  : binary parity-check matrix, shape (num_ancilla, num_data)
-          - s  : syndrome vector, shape (num_ancilla,)
-          - d_pos : list of global (row, col) positions of data qubits
+          - H: binary parity-check matrix, shape (num_ancilla, num_data)
+          - s: syndrome vector, shape (num_ancilla,)
+          - d_pos: list of global (row, col) positions of data qubits
 
         KEY DESIGN DECISION — separate xQ and zQ rows:
         -----------------------------------------------
-        xQ ancillas implement X stabilizers and detect *Z* errors.
-        zQ ancillas implement Z stabilizers and detect *X* errors.
-        Mixing them into a single H causes rank deficiency in small blocks
-        (e.g. in a 2×2 node the xQ and zQ adjacency rows are identical,
-        so the combined H has rank 1 while a mixed syndrome like s=[0,1]
-        is inconsistent → OSD returns e=0 and no correction is applied).
-
+        xQ ancillas implement X stabilizers and detect Z errors.
+        zQ ancillas implement Z stabilizers and detect X errors.
         We therefore build H_Z (zQ rows) and H_X (xQ rows) separately and
         stack only the rows that have at least one non-zero syndrome entry,
         preferring the set that is self-consistent.  If both are active we
         stack them; the coordinator's GF(2) OSD handles the joint system
         correctly because xQ and zQ never share a column after elimination.
         """
-        B        = self.layout_manager.block_size
+        B = self.layout_manager.block_size
         r_node, c_node = self.node_coords
-        d_pos    = []
-        zq_pos   = []   # positions of zQ ancillas (detect X errors)
-        xq_pos   = []   # positions of xQ ancillas (detect Z errors)
+        d_pos = []      # positions of data qubits (pQ)
+        zq_pos = []     # positions of zQ ancillas (detect X errors)
+        xq_pos = []     # positions of xQ ancillas (detect Z errors)
 
         for r in range(B):
             for c in range(B):
-                gr, gc = r_node * B + r, c_node * B + c
+                gr, gc = r_node * B + r, c_node * B + c # global position of this qubit
                 role   = self.qubit_roles[r][c]
                 if role == "pQ":
                     d_pos.append((gr, gc))
@@ -415,14 +444,14 @@ class ClusterNodeProgram(Program):
         n = len(d_pos)
 
         def _make_H_and_s(anc_pos):
-            """Build (H_block, s_block) for a list of ancilla positions."""
+            # Build (H_block, s_block) for a list of ancilla positions.
             H_block = np.zeros((len(anc_pos), n), dtype=int)
             for i, (ar, ac) in enumerate(anc_pos):
                 for j, (dr, dc) in enumerate(d_pos):
                     if abs(ar - dr) + abs(ac - dc) == 1:
-                        H_block[i, j] = 1
+                        H_block[i, j] = 1                   # This ancilla is connected to this data qubit → 1 in H
             s_block = np.array(
-                [self.ancilla_measurements.get((p[0] % B, p[1] % B), 0)
+                [self.ancilla_measurements.get((p[0] % B, p[1] % B), 0)     # Syndrome value for this ancilla, default to 0 if not measured (e.g. if no ancilla in this position) or if position not found due to some error. The coordinator will handle any inconsistencies.
                  for p in anc_pos],
                 dtype=int,
             )
@@ -437,8 +466,8 @@ class ClusterNodeProgram(Program):
         active_X = np.any(s_X)
 
         if active_Z and active_X:
-            H = np.vstack([H_Z, H_X])
-            s = np.concatenate([s_Z, s_X])
+            H = np.vstack([H_Z, H_X])           # Stack both Z and X stabilizer rows if both are active. The coordinator's OSD will handle the joint system correctly because xQ and zQ never share a column after elimination.
+            s = np.concatenate([s_Z, s_X])      # Stack corresponding syndromes
         elif active_Z:
             H = H_Z
             s = s_Z
@@ -448,8 +477,8 @@ class ClusterNodeProgram(Program):
         else:
             # No active syndrome: return full H (both blocks) with zero syndrome
             # so the coordinator gets the correct structure even if inactive.
-            H = np.vstack([H_Z, H_X]) if (len(zq_pos) + len(xq_pos)) > 0 else np.zeros((0, n), dtype=int)
-            s = np.zeros(H.shape[0], dtype=int)
+            H = np.vstack([H_Z, H_X]) if (len(zq_pos) + len(xq_pos)) > 0 else np.zeros((0, n), dtype=int)       # If there are no ancillas at all, return an empty H with shape (0, n) to avoid confusion with a single row of zeros.
+            s = np.zeros(H.shape[0], dtype=int)     # All-zero syndrome
 
         return H, s, d_pos
 
@@ -462,13 +491,6 @@ class ClusterNodeProgram(Program):
         data-qubit space, then select the k representative qubits (columns of H)
         that best span those directions.
 
-        Why column *selection* rather than projection onto real-valued singular vectors:
-          - OSD operates over GF(2): H and s must be binary integers.
-          - Back-projection of a binary e_reduced through a real V_k is ambiguous:
-              e.g. |V_k @ [1]| = [0.707, 0.707] -> round -> [1, 1]  (both qubits corrected!)
-          - With column selection, V_k is an exact {0,1} matrix:
-              e_full[selected_col[i]] = e_reduced[i], all other positions = 0.
-            Back-projection is lossless.
 
         Algorithm:
           1. SVD of H (real) -> right singular vectors Vt  (shape: min(m,n) x n)
@@ -480,7 +502,7 @@ class ClusterNodeProgram(Program):
 
         For large blocks (e.g. 4x4 nodes) this achieves genuine compression:
         k ~ 3-4 instead of n=8, halving the payload sent to the coordinator.
-        For small blocks (2x2) k=n=2 so no compression, which is correct.
+        For small blocks (2x2) k=n=2 so no compression.
         """
         if energy_threshold is None:
             energy_threshold = self.ENERGY_THRESHOLD
@@ -504,9 +526,9 @@ class ClusterNodeProgram(Program):
         # Determine k via energy threshold
         total_energy = np.sum(sigma ** 2)
         k = n
-        if total_energy > 1e-10:
-            cumulative = np.cumsum(sigma ** 2)
-            k = int(np.searchsorted(cumulative,
+        if total_energy > 1e-10:                # Avoid division by zero if H is all zeros (shouldn't happen if active, but just in case)
+            cumulative = np.cumsum(sigma ** 2)  # Cumulative energy captured by top singular values
+            k = int(np.searchsorted(cumulative, # Find the smallest k such that cumulative energy >= threshold * total_energy
                                     energy_threshold * total_energy) + 1)
             k = min(k, n)
 
@@ -558,8 +580,8 @@ class ClusterNodeProgram(Program):
         return json.loads(msg)
 
     def _apply_corrections(self, corrections: list):
-        r_node, c_node   = self.node_coords
-        B                = self.layout_manager.block_size
+        r_node, c_node = self.node_coords
+        B = self.layout_manager.block_size
         r_start, c_start = r_node * B, c_node * B
 
         for r_global, c_global in corrections:

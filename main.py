@@ -10,7 +10,7 @@ from dis_surface_code import ClusterNodeProgram
 from coordinator import CoordinatorProgram
 
 def main():
-    global_size    = 4   # planar surface code with 10x10 qubits (100 qubits total)
+    global_size    = 8   # planar surface code with 10x10 qubits (100 qubits total)
     nodes_per_side = 2   # 2x2 grid of nodes, each node manages a 5x5 subgrid
 
     # Step 1: Create the Surface Layout Manager

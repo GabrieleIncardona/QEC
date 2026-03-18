@@ -24,10 +24,10 @@ class CoordinatorProgram(Program):
             name="coordinator",
             csockets=self.node_names,
             epr_sockets=[],
-            max_qubits=1,
+            max_qubits=1,       # SquidASM requires at least 1 qubit, but the coordinator doesn't actually use it. We just won't do anything with it.
         )
+    
     # Run
-
     def run(self, context: ProgramContext):
         # Step 1: receive payloads
         payloads = []
@@ -72,7 +72,7 @@ class CoordinatorProgram(Program):
             return None, None, []
 
         H_blocks, s_list, registry = [], [], []
-        col_offset = 0
+        col_offset = 0                                      # Column offset for each block in the global H, used for back-projection of corrections
 
         for p in active:
             H_red = np.array(p["H_reduced"])   # (m_i, k_i)
@@ -83,7 +83,7 @@ class CoordinatorProgram(Program):
             H_blocks.append(H_red)
             s_list.extend(s_i.tolist())
 
-            registry.append({
+            registry.append({                                # Store info needed for back-projection of corrections to each node
                 "node_id":        tuple(p["node_id"]),
                 "V_k":            V_k,
                 "data_positions": [tuple(pos) for pos in p["data_positions"]],
@@ -128,8 +128,8 @@ class CoordinatorProgram(Program):
             pivot_rows.append(row)
             row += 1
 
-        non_pivot = [c for c in range(K_tot) if c not in pivot_cols]
-        test_cols = non_pivot[:osd_order]
+        non_pivot = [c for c in range(K_tot) if c not in pivot_cols]            # Columns corresponding to free variables (non-pivots)
+        test_cols = non_pivot[:osd_order]                                       # Columns to test for flipping in OSD (limited by osd_order)
         n_test = len(test_cols)
 
         best_weight = K_tot + 1
@@ -139,13 +139,13 @@ class CoordinatorProgram(Program):
         for pattern in range(2 ** n_test):
             e = np.zeros(K_tot, dtype=int)
             for b, tc in enumerate(test_cols):
-                e[tc] = (pattern >> b) & 1
+                e[tc] = (pattern >> b) & 1              # Set test pattern bits in e for the selected free columns
 
             # Solve pivot bits mod 2
             for pc, pr in zip(pivot_cols, pivot_rows):
                 rhs = s_sys[pr]
                 for fc in non_pivot:
-                    rhs = (rhs + H_sys[pr, fc] * e[fc]) % 2
+                    rhs = (rhs + H_sys[pr, fc] * e[fc]) % 2         # Update rhs by adding contributions from free variables
                 e[pc] = rhs
 
             weight = int(np.sum(e))
@@ -160,7 +160,7 @@ class CoordinatorProgram(Program):
         corrections = {}
         for reg in registry:
             e_block = e_global[reg["col_start"]:reg["col_end"]]   # shape (k,)
-            V_k     = reg["V_k"]                                   # shape (n, k)
+            V_k = reg["V_k"]                                      # shape (n, k)
 
             # Back-project from reduced space to full data-qubit space and binarise.
             # V_k @ e_block maps the k-dimensional correction back to n data qubits.
