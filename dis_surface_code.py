@@ -74,6 +74,7 @@ class ClusterNodeProgram(Program):
         #   1 = odd number of Z gates (equivalent to active Z gate)
 
         z_parity = [[0] * B for _ in range(B)]  # Classical register tracking Z gates
+        x_parity = [[0] * B for _ in range(B)]  # Classical register tracking X gates
         all_round_syndromes = []
 
         for round_idx in range(self.NUM_ROUNDS):
@@ -116,11 +117,13 @@ class ClusterNodeProgram(Program):
             yield from conn.flush()
 
             # c) Original TeleGate protocol — returns Z gates applied this round
-            round_z = yield from self._teleported_cnot_borders(context)
+            round_z, round_x = yield from self._teleported_cnot_borders(context)
 
             # d) Update z_parity with Z gates from this round
             for (r, c) in round_z:
                 z_parity[r][c] ^= 1
+            for (r, c) in round_x:
+                x_parity[r][c] ^= 1
 
             # e) Measure ancillas with Z compensation for xQ
             # For each xQ ancilla, if a neighboring data qubit has z_parity==1,
@@ -152,8 +155,14 @@ class ClusterNodeProgram(Program):
                                 z_flip ^= 1
                         round_syndrome[(r, c)] = raw ^ z_flip
                     else:
-                        # zQ measures Z parity, which is unaffected by Z gates on data qubits (commutes), so no compensation needed.
-                        round_syndrome[(r, c)] = raw
+                        x_flip = 0
+                        for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                            nr, nc = r + dr, c + dc
+                            if (0 <= nr < B and 0 <= nc < B 
+                                and self.qubit_roles[nr][nc] == "pQ" 
+                                and x_parity[nr][nc] == 1):
+                                x_flip ^= 1
+                        round_syndrome[(r, c)] = raw ^ x_flip
 
             all_round_syndromes.append(round_syndrome)
             active = {k: v for k, v in round_syndrome.items() if v == 1}
@@ -172,9 +181,10 @@ class ClusterNodeProgram(Program):
               f"{active_final if active_final else 'clean'}")
 
         # ── 5. SVD payload and corrections ────────────────────────────────
-        payload = self._build_svd_payload()
-        corrections = yield from self._communicate_with_coordinator(context, payload)
-        self._apply_corrections(corrections)
+        payload_X, payload_Z = self._build_svd_payloads()
+        corr_X, corr_Z = yield from self._communicate_with_coordinator(context, payload_X, payload_Z)
+        self._apply_corrections(corr_X, gate="X")
+        self._apply_corrections(corr_Z, gate="Z")
 
         if self.applied_corrections:
             print(f"[{self.node_coords}] Corrections: {sorted(self.applied_corrections)}")
@@ -218,13 +228,14 @@ class ClusterNodeProgram(Program):
         N = self.layout_manager.nodes_per_side
         B = self.layout_manager.block_size
         round_z = set()
+        round_x = set()
 
         # ── Phase 1: horizontal links (between left/right neighbors) ──────────
         # Process in order: column c=0..N-2, for each column all rows r=0..N-1
         for c in range(N - 1):
             # Link between (r_node, c) and (r_node, c+1)
             if c_node == c:          # this node is the LEFT side → ancilla_side=True
-                z_set = yield from self._run_border_direction(
+                z_set, x_set = yield from self._run_border_direction(
                     context,
                     neighbor = f"node_{r_node}_{c_node + 1}",
                     is_ancilla_side = True,
@@ -232,8 +243,9 @@ class ClusterNodeProgram(Program):
                     local_fixed = B - 1,   # rightmost column of this node
                 )
                 round_z ^= z_set
+                round_x ^= x_set
             elif c_node == c + 1:    # this node is the RIGHT side → ancilla_side=False
-                z_set = yield from self._run_border_direction(
+                z_set, x_set = yield from self._run_border_direction(
                     context,
                     neighbor = f"node_{r_node}_{c_node - 1}",
                     is_ancilla_side = False,
@@ -241,6 +253,7 @@ class ClusterNodeProgram(Program):
                     local_fixed = 0,        # leftmost column of this node
                 )
                 round_z ^= z_set
+                round_x ^= x_set
             # else: this node is not part of this link, skip
 
         # ── Phase 2: vertical links (between top/bottom neighbors) ────────────
@@ -248,7 +261,7 @@ class ClusterNodeProgram(Program):
         for r in range(N - 1):
             # Link between (r, c_node) and (r+1, c_node)
             if r_node == r:          # this node is the TOP side → ancilla_side=True
-                z_set = yield from self._run_border_direction(
+                z_set, x_set = yield from self._run_border_direction(
                     context,
                     neighbor        = f"node_{r_node + 1}_{c_node}",
                     is_ancilla_side = True,
@@ -256,8 +269,9 @@ class ClusterNodeProgram(Program):
                     local_fixed     = B - 1,   # bottom row of this node
                 )
                 round_z ^= z_set
+                round_x ^= x_set
             elif r_node == r + 1:    # this node is the BOTTOM side → ancilla_side=False
-                z_set = yield from self._run_border_direction(
+                z_set, x_set = yield from self._run_border_direction(
                     context,
                     neighbor        = f"node_{r_node - 1}_{c_node}",
                     is_ancilla_side = False,
@@ -265,9 +279,10 @@ class ClusterNodeProgram(Program):
                     local_fixed     = 0,        # top row of this node
                 )
                 round_z ^= z_set
+                round_x ^= x_set
             # else: not part of this link, skip
 
-        return round_z
+        return round_z, round_x
 
     def _run_border_direction(self, context, *, neighbor: str,
                                is_ancilla_side: bool, axis: str,
@@ -298,6 +313,7 @@ class ClusterNodeProgram(Program):
         csock = context.csockets[neighbor]
         epr_sock = context.epr_sockets[neighbor]
         z_applied = set()
+        x_applied = set()
 
         for idx in range(B):
             r_loc, c_loc = (local_fixed, idx) if axis == "col" else (idx, local_fixed)
@@ -327,17 +343,17 @@ class ClusterNodeProgram(Program):
 
                 ancilla = self.local_qubits[r_loc][c_loc]
 
-                eA = epr_sock.create_keep()[0]
+                # eA = epr_sock.create_keep()[0]
                 csock.send(role_signal)
                 yield from conn.flush()
 
                 if role_signal == "skip":
-                    eA.measure()
-                    yield from conn.flush()
+                    #eA.measure()
+                    #yield from conn.flush()
                     yield from csock.recv()
                     continue
 
-                #eA = epr_sock.create_keep()[0]
+                eA = epr_sock.create_keep()[0]
 
                 if role_signal == "xQ":
                     ancilla.cnot(eA)
@@ -361,23 +377,24 @@ class ClusterNodeProgram(Program):
                     yield from conn.flush()
 
             else:
-                eB = epr_sock.recv_keep()[0]
-                yield from conn.flush()
+                # eB = epr_sock.recv_keep()[0]
+                # yield from conn.flush()
                 signal = yield from csock.recv()
 
                 if signal == "skip" or self.qubit_roles[r_loc][c_loc] != "pQ":
-                    eB.measure()
-                    yield from conn.flush()
+                    #eB.measure()
+                    #yield from conn.flush()
                     csock.send("0")
                     yield from conn.flush()
                     continue
                 
-                #eB = epr_sock.recv_keep()[0]
+                eB = epr_sock.recv_keep()[0]
                 data = self.local_qubits[r_loc][c_loc]
 
                 if signal == "xQ":
                     m_A = int((yield from csock.recv()))
                     if m_A == 1:
+                        x_applied.add((r_loc, c_loc))
                         eB.X()
                     eB.cnot(data)
                     eB.H()
@@ -401,7 +418,7 @@ class ClusterNodeProgram(Program):
                         else:
                             z_applied.add((r_loc, c_loc))
 
-        return z_applied
+        return z_applied, x_applied
 
     # ------------------------------------------------------------------ #
     #  SVD payload                                                         #
@@ -459,138 +476,74 @@ class ClusterNodeProgram(Program):
 
         H_Z, s_Z = _make_H_and_s(zq_pos)   # Z stabilizers → X error detection
         H_X, s_X = _make_H_and_s(xq_pos)   # X stabilizers → Z error detection
+        return H_Z, s_Z, H_X, s_X, d_pos
 
-        # Only include rows whose syndrome is actually non-trivial, to avoid
-        # inflating the system with inconsistent zero-syndrome / dependent rows.
-        active_Z = np.any(s_Z)
-        active_X = np.any(s_X)
-
-        if active_Z and active_X:
-            H = np.vstack([H_Z, H_X])           # Stack both Z and X stabilizer rows if both are active. The coordinator's OSD will handle the joint system correctly because xQ and zQ never share a column after elimination.
-            s = np.concatenate([s_Z, s_X])      # Stack corresponding syndromes
-        elif active_Z:
-            H = H_Z
-            s = s_Z
-        elif active_X:
-            H = H_X
-            s = s_X
-        else:
-            # No active syndrome: return full H (both blocks) with zero syndrome
-            # so the coordinator gets the correct structure even if inactive.
-            H = np.vstack([H_Z, H_X]) if (len(zq_pos) + len(xq_pos)) > 0 else np.zeros((0, n), dtype=int)       # If there are no ancillas at all, return an empty H with shape (0, n) to avoid confusion with a single row of zeros.
-            s = np.zeros(H.shape[0], dtype=int)     # All-zero syndrome
-
-        return H, s, d_pos
-
-    def _build_svd_payload(self, energy_threshold: float = None) -> dict:
-        """Build the SVD-compressed payload to send to the coordinator.
-
-        SVD-BASED COLUMN SELECTION FOR GF(2)-COMPATIBLE COMPRESSION
-        -------------------------------------------------------------
-        We use SVD to identify the k most 'energy-carrying' directions in the
-        data-qubit space, then select the k representative qubits (columns of H)
-        that best span those directions.
-
-
-        Algorithm:
-          1. SVD of H (real) -> right singular vectors Vt  (shape: min(m,n) x n)
-          2. Keep top-k singular vectors (energy threshold).
-          3. For each of the k dimensions, pick the data qubit j = argmax |Vt[i, j]|.
-             These are the qubits most aligned with the principal directions of H.
-          4. H_reduced = H[:, selected_cols]  (binary, m x k)
-          5. V_k = binary selection matrix (n x k), with V_k[selected_cols[i], i] = 1.
-
-        For large blocks (e.g. 4x4 nodes) this achieves genuine compression:
-        k ~ 3-4 instead of n=8, halving the payload sent to the coordinator.
-        For small blocks (2x2) k=n=2 so no compression.
-        """
+    def _build_svd_payloads(self, energy_threshold=None):
         if energy_threshold is None:
             energy_threshold = self.ENERGY_THRESHOLD
 
-        H, s, data_pos = self._build_local_system()
+        H_Z, s_Z, H_X, s_X, data_pos = self._build_local_system()
 
-        if H.size == 0 or not np.any(s):
+        def _make_payload(H, s, error_type):
+            if H.size == 0 or not np.any(s):
+                return {"active": False, "node_id": list(self.node_coords),
+                        "error_type": error_type,
+                        "data_positions": [list(p) for p in data_pos]}
+            m, n = H.shape
+            U, sigma, Vt = np.linalg.svd(H.astype(float), full_matrices=False)
+            total_energy = np.sum(sigma ** 2)
+            k = n
+            if total_energy > 1e-10:
+                cumulative = np.cumsum(sigma ** 2)
+                k = min(int(np.searchsorted(cumulative, energy_threshold * total_energy) + 1), n)
+            selected_cols = []
+            for i in range(k):
+                for j in np.argsort(-np.abs(Vt[i])):
+                    if j not in selected_cols:
+                        selected_cols.append(j); break
+            for j in range(n):
+                if len(selected_cols) >= k: break
+                if j not in selected_cols: selected_cols.append(j)
+            H_reduced = H[:, selected_cols].astype(int)
+            V_k = np.zeros((n, k), dtype=float)
+            for i, col in enumerate(selected_cols):
+                V_k[col, i] = 1.0
+            r_node, c_node = self.node_coords
+            B = self.layout_manager.block_size
             return {
-                "active":         False,
-                "node_id":        list(self.node_coords),
+                "active": True, "node_id": list(self.node_coords),
+                "error_type": error_type,
+                "H_reduced": H_reduced.tolist(), "V_k": V_k.tolist(),
+                "s": s.tolist(), "k": k,
                 "data_positions": [list(p) for p in data_pos],
+                "global_offset": [r_node * B, c_node * B],
             }
 
-        r_node, c_node = self.node_coords
-        B  = self.layout_manager.block_size
-        m, n = H.shape
+        return _make_payload(H_Z, s_Z, "X"), _make_payload(H_X, s_X, "Z")
 
-        # --- SVD to find principal directions in qubit space ---
-        U, sigma, Vt = np.linalg.svd(H.astype(float), full_matrices=False)
-
-        # Determine k via energy threshold
-        total_energy = np.sum(sigma ** 2)
-        k = n
-        if total_energy > 1e-10:                # Avoid division by zero if H is all zeros (shouldn't happen if active, but just in case)
-            cumulative = np.cumsum(sigma ** 2)  # Cumulative energy captured by top singular values
-            k = int(np.searchsorted(cumulative, # Find the smallest k such that cumulative energy >= threshold * total_energy
-                                    energy_threshold * total_energy) + 1)
-            k = min(k, n)
-
-        # --- Select k representative columns (data qubits) ---
-        # For each of the top-k singular vectors, pick the qubit with highest loading.
-        # This gives a set of k qubits that best span the principal error directions.
-        selected_cols = []
-        for i in range(k):
-            # Candidates ordered by |loading| on singular vector i
-            order = np.argsort(-np.abs(Vt[i]))
-            for j in order:
-                if j not in selected_cols:
-                    selected_cols.append(j)
-                    break
-
-        # Fill up to k if any duplicates were skipped (shouldn't happen, but defensive)
-        for j in range(n):
-            if len(selected_cols) >= k:
-                break
-            if j not in selected_cols:
-                selected_cols.append(j)
-
-        # --- Build binary reduced system ---
-        H_reduced = H[:, selected_cols].astype(int)    # (m, k) — exact binary submatrix
-
-        # V_k: exact {0,1} selection matrix (n x k).
-        # Back-projection: e_full[selected_cols[i]] = e_reduced[i], others = 0.
-        # Using float dtype for compatibility with coordinator's np.array(V_k, dtype=float).
-        V_k = np.zeros((n, k), dtype=float)
-        for i, col in enumerate(selected_cols):
-            V_k[col, i] = 1.0
-
-        return {
-            "active":         True,
-            "node_id":        list(self.node_coords),
-            "H_reduced":      H_reduced.tolist(),
-            "V_k":            V_k.tolist(),
-            "s":              s.tolist(),
-            "k":              k,
-            "data_positions": [list(p) for p in data_pos],
-            "global_offset":  [r_node * B, c_node * B],
-        }
-
-    def _communicate_with_coordinator(self, context, payload: dict):
+    def _communicate_with_coordinator(self, context, payload_X, payload_Z):
         csock = context.csockets[self.coordinator_name]
-        csock.send(json.dumps(payload))
+        csock.send(json.dumps(payload_X))
+        csock.send(json.dumps(payload_Z))
         yield from context.connection.flush()
-        msg = yield from csock.recv()
-        return json.loads(msg)
+        msg_X = yield from csock.recv()
+        msg_Z = yield from csock.recv()
+        return json.loads(msg_X), json.loads(msg_Z)
 
-    def _apply_corrections(self, corrections: list):
+    def _apply_corrections(self, corrections: list, gate: str = "X"):
         r_node, c_node = self.node_coords
         B = self.layout_manager.block_size
         r_start, c_start = r_node * B, c_node * B
-
         for r_global, c_global in corrections:
             if (r_start <= r_global < r_start + B
                     and c_start <= c_global < c_start + B):
                 r_local = r_global - r_start
                 c_local = c_global - c_start
                 if self.qubit_roles[r_local][c_local] == "pQ":
-                    self.local_qubits[r_local][c_local].X()
+                    if gate == "X":
+                        self.local_qubits[r_local][c_local].X()
+                    else:
+                        self.local_qubits[r_local][c_local].Z()
                     self.applied_corrections.add((r_local, c_local))
 
     # ------------------------------------------------------------------ #
@@ -607,8 +560,9 @@ class ClusterNodeProgram(Program):
             parity = 0
             for r in range(B):
                 if self.qubit_roles[r][0] == "pQ":
-                    parity ^= int((r, 0) in self.injected_errors)
-                    parity ^= int((r, 0) in self.applied_corrections)
+                    m1 = self.local_qubits[r][0].measure()
+                    yield from context.connection.flush()
+                    parity ^= int(m1)
             csock.send(json.dumps(parity))
 
         yield from context.connection.flush()

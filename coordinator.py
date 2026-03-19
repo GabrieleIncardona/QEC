@@ -30,27 +30,24 @@ class CoordinatorProgram(Program):
     # Run
     def run(self, context: ProgramContext):
         # Step 1: receive payloads
-        payloads = []
+        payloads_X, payloads_Z = [], []
         for name in self.node_names:
-            msg = yield from context.csockets[name].recv()
-            payloads.append(json.loads(msg))
+            msg_X = yield from context.csockets[name].recv()
+            msg_Z = yield from context.csockets[name].recv()
+            payloads_X.append(json.loads(msg_X))
+            payloads_Z.append(json.loads(msg_Z))
 
-        # Step 2: assemble block-diagonal system
-        H_global, s_global, registry = self._assemble_global_system(payloads)
+    
 
-        # Step 3: OSD over GF(2)
-        if H_global is not None:
-            e_global = self._osd_gf2(H_global, s_global)
-            # Only apply corrections if a non-trivial error was found
-            if np.any(e_global):
-                corrections_per_node = self._project_corrections(e_global, registry)
+        # Step 2: assemble block-diagonal system and run OSD separately for X and Z errors
+        for payloads, error_type in [(payloads_X, "X"), (payloads_Z, "Z")]:
+            H_global, s_global, registry = self._assemble_global_system(payloads)
+            if H_global is not None:
+                e_global = self._osd_gf2(H_global, s_global)
+                corrections = self._project_corrections(e_global, registry) if np.any(e_global) else {}
             else:
-                corrections_per_node = {}
-        else:
-            corrections_per_node = {}
-
-        # Step 4+5: send corrections to each node
-        yield from self._send_corrections(context, payloads, corrections_per_node)
+                corrections = {}
+            yield from self._send_corrections(context, payloads, corrections)
 
         # Step 6: aggregate logical-Z parities
         global_parity = 0
