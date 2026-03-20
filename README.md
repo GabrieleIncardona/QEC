@@ -1,26 +1,44 @@
-# Distributed Surface Code Simulation with SquidASM
-This repository implements a Distributed Surface Code architecture using the SquidASM framework. The project demonstrates how a large-scale error-correcting code can be partitioned across multiple quantum nodes, using entanglement to perform stabilizer measurements across physical boundaries.
+# Distributed Surface Code Simulation
 
-## 1. Distributed Grid Architecture
-In this implementation, the global Surface Code is not a single monolithic circuit. Instead, it is a tessellation of subgrids, where each node in a network operates a specific "tile" of the total code.
-## Node-Subgrid Mapping
-- **Nodal Autonomy**: Each node manages its own set of physical data qubits and ancillas.
-- **Layout Manager**: A global manager assigns roles (pQ, zQ, xQ) to qubits based on their global coordinates, ensuring that the union of all nodes forms a valid Surface Code.
-- **Boundary Intersections**: Stabilizers located at the edges of a node’s subgrid must interact with data qubits located in a neighbor's subgrid.
+This project implements a distributed quantum surface code simulation using **SquidASM** and **NetSquid**. It simulates a planar surface code split across multiple network nodes (a cluster), which collaboratively perform syndrome measurements and rely on a central coordinator for global decoding.
 
-## 2. Distributed Operation Model
-The core of the project is the Entanglement-Assisted CNOT protocol, which allows an ancilla in Node A to perform a parity check on a data qubit in Node B.
-## The 5-Phase Cycle
-1. **EPR Link Establishment:** Pairs of entangled qubits are generated and distributed between adjacent nodes. These EPR pairs serve as the "quantum bridges" between subgrids.
-2. **Local Resource Initialization:** Physical qubits are allocated locally within each node.
-3. **Cross-Node Parity Checks:** Ancilla qubits perform local gates and then interact with the shared EPR pairs. By measuring the EPR half, the "control" information is projected across the network boundary.
-4. **Classical Communication Layer:** Nodes exchange measurement results via classical channels. This layer is synchronized to ensure that every node has the necessary information from its neighbors before proceeding.
-5. **Distributed Gate Completion:** Based on received classical data, nodes apply local Pauli corrections to their data qubits, successfully completing the multi-node CNOT gates.
+## 📌 Features
 
-## 3. Features & Scalability
-- **Seamless Boundary Logic:** The system automatically identifies if a neighbor exists. If a node is on the edge of the total grid, it correctly treats the stabilizer as a "physical boundary" (weight-2), whereas internal node boundaries are treated as "distributed links" (weight-4).
-- **Asynchronous-Friendly Design:** By separating the quantum measurement phase from the classical correction phase, the implementation allows for efficient processing of classical bitstreams across the distributed network.
-- **Modular Codebase:** The implementation is designed to scale with the code distance d. By increasing the block_size or the number of nodes, one can simulate larger Surface Codes without changing the underlying nodal logic.
+* **Distributed Architecture**: Divides a global qubit grid into smaller subgrids managed by distinct cluster nodes.
+* **TeleGate Protocol**: Implements a globally canonical border protocol to perform stabilizer measurements across node boundaries using EPR pairs.
+* **Spacetime Decoding**: Performs multiple rounds of stabilizer measurements (default: 2) and uses the XORed syndrome to handle measurement errors.
+* **SVD Compression**: Each node locally compresses its parity-check matrix and syndrome using Singular Value Decomposition (SVD) to reduce communication overhead, keeping a configurable energy threshold (default: 95%).
+* **Global OSD Decoder**: A centralized `coordinator` node assembles the reduced local systems into a block-diagonal global matrix and performs Ordered Statistic Decoding (OSD) over GF(2).
 
-## 4. Setup and Execution
-The simulation requires the squidasm and netqasm libraries. It is configured to run on a simulated topology where nodes are connected in a 2D mesh, matching the logical structure of the Surface Code.
+## 🗂️ Project Structure
+
+* **`main.py`**: The entry point of the simulation. It configures the complete-graph network topology, initializes the layout manager, sets up the cluster nodes and the coordinator, and runs the simulation.
+* **`surface_code.py`**: Contains the `SurfaceLayout` class. It manages the mapping of the global grid into local subgrids, assigning roles to qubits (`pQ` for data, `xQ` for X-stabilizers, `zQ` for Z-stabilizers) in a checkerboard pattern.
+* **`dis_surface_code.py`** (`ClusterNodeProgram`): The program running on each local node. It handles:
+    * Local qubit allocation and noise injection.
+    * Local CNOT operations for stabilizers.
+    * Cross-node CNOTs via the TeleGate border protocol.
+    * Building the local parity-check matrices ($H_X$, $H_Z$).
+    * SVD dimensionality reduction.
+    * Applying corrections received from the coordinator.
+* **`coordinator.py`** (`CoordinatorProgram`): The centralized decoder. It handles:
+    * Receiving SVD-compressed payloads from all active nodes.
+    * Assembling a global block-diagonal system.
+    * Running Gaussian elimination and OSD over GF(2) to find the most probable error vector.
+    * Back-projecting the reduced error vector to the physical data qubits.
+    * Sending local correction instructions back to the cluster nodes.
+    * Aggregating the final logical-Z parity to check for logical failures.
+
+## 🚀 How to Run
+
+### Prerequisites
+Ensure you have Python installed along with the required quantum simulation libraries and math packages:
+* `squidasm`
+* `netsquid-netbuilder`
+* `numpy`
+
+### Execution
+Run the main script from your terminal:
+
+```bash
+python main.py
