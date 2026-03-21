@@ -37,8 +37,6 @@ class CoordinatorProgram(Program):
             payloads_X.append(json.loads(msg_X))
             payloads_Z.append(json.loads(msg_Z))
 
-    
-
         # Step 2: assemble block-diagonal system and run OSD separately for X and Z errors
         for payloads, error_type in [(payloads_X, "X"), (payloads_Z, "Z")]:
             H_global, s_global, registry = self._assemble_global_system(payloads)
@@ -61,6 +59,7 @@ class CoordinatorProgram(Program):
         print(f"\n=== Logical Z (global) = {global_parity} → {status} ===\n")
 
         yield from context.connection.flush()
+        return global_parity
 
     # Step 2 — Assemble block-diagonal global system
     def _assemble_global_system(self, payloads: list) -> tuple:

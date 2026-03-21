@@ -6,9 +6,8 @@ from netsquid_netbuilder.modules.qlinks.perfect import PerfectQLinkConfig
 from netsquid_netbuilder.modules.clinks.default import DefaultCLinkConfig
 
 from surface_code import SurfaceLayout
-#from dis_surface_code import ClusterNodeProgram
+from dis_surface_code import ClusterNodeProgram
 from coordinator import CoordinatorProgram
-from dis_surface_code_debug import ClusterNodeProgram
 
 def main():
     global_size    = 8   # planar surface code with 10x10 qubits (100 qubits total)
@@ -52,6 +51,7 @@ def main():
     )
 
     # Step 5: Run the simulation
+    num_runs = 100
     print("Running Distributed Surface Code simulation...")
     print(f"Global grid   : {global_size}x{global_size} qubits")
     print(f"Cluster nodes : {len(cluster_node_names)} nodes "
@@ -59,10 +59,23 @@ def main():
     print(f"Decoder       : local SVD compression + global OSD at coordinator")
 
     try:
-        results = run_simulation(config=cfg, programs=programs, num_times=1)
-        print("\n--- RESULTS ---")
-        for result in results:
-            print(f"  {result}")
+        results = run_simulation(config=cfg, programs=programs, num_times=num_runs)
+
+        parities = []
+        for node_results in results:
+            for res in node_results:
+                if isinstance(res, int):  # Logical parity results are integers (0 or 1) only sent by the coordinator
+                    parities.append(res)
+                    
+        # Calculate statistics
+        failures = sum(parities)                # Every 1 is a failure
+        successes = num_runs - failures         # The rest are successes
+        accuracy = (successes / num_runs) * 100 # Calculate percentage
+        
+        print(f"SIMULATION COMPLETE ({num_runs} runs)")
+        print(f"Failures (Logical Error) : {failures}")
+        print(f" Successes: {successes}")
+        print(f"📈 Accuracy: {accuracy:.2f}%")
 
     except Exception as e:
         print(f"\nError: {e}")
