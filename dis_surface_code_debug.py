@@ -275,7 +275,18 @@ class ClusterNodeProgram(Program):
 
         for idx in range(B):
             r_loc, c_loc = (local_fixed, idx) if axis == "col" else (idx, local_fixed)
+            r_glob = self.node_coords[0] * B + r_loc
+            c_glob = self.node_coords[1] * B + c_loc
+            role = self.qubit_roles[r_loc][c_loc]
             
+            if axis == "col":
+                dc = 1 if local_fixed == B - 1 else -1
+                nr_glob, nc_glob = r_glob, c_glob + dc
+            else:
+                dr = 1 if local_fixed == B - 1 else -1
+                nr_glob, nc_glob = r_glob + dr, c_glob
+                
+            remote_role = self.layout_manager.get_qubit_role(nr_glob, nc_glob)
 
             if is_ancilla_side:
                 anc_role = self.qubit_roles[r_loc][c_loc]
@@ -291,12 +302,8 @@ class ClusterNodeProgram(Program):
                   (zQ measures Z parity with up/down neighbors).
                 If the ancilla has no remote neighbors in the correct direction → skip.
                 """
-                if anc_role == "xQ" and axis == "row":
-                    role_signal = "skip"  # xQ has no vertical remote neighbors
-                elif anc_role == "zQ" and axis == "col":
-                    role_signal = "skip"  # zQ has no horizontal remote neighbors
-                elif anc_role in ("xQ", "zQ"):
-                    role_signal = anc_role
+                if role in ("xQ", "zQ") and remote_role == "pQ":
+                    role_signal = role
                 else:
                     role_signal = "skip"
 
@@ -313,6 +320,7 @@ class ClusterNodeProgram(Program):
                     continue
 
                 eA = epr_sock.create_keep()[0]
+                yield from conn.flush()
 
                 if role_signal == "xQ":
                     ancilla.cnot(eA)
@@ -349,12 +357,13 @@ class ClusterNodeProgram(Program):
                     continue
                 
                 eB = epr_sock.recv_keep()[0]
+                yield from conn.flush()
                 data = self.local_qubits[r_loc][c_loc]
 
                 if signal == "xQ":
                     m_A = int((yield from csock.recv()))
                     if m_A == 1:
-                        x_applied.add((r_loc, c_loc))
+                        #x_applied.add((r_loc, c_loc))
                         eB.X()
                     eB.cnot(data)
                     eB.H()

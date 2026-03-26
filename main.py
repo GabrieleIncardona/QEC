@@ -1,4 +1,6 @@
 import traceback
+from contextlib import redirect_stdout
+import netsquid as n
 
 from squidasm.run.stack.run import run as run_simulation
 from squidasm.util.util import create_complete_graph_network
@@ -6,12 +8,13 @@ from netsquid_netbuilder.modules.qlinks.perfect import PerfectQLinkConfig
 from netsquid_netbuilder.modules.clinks.default import DefaultCLinkConfig
 
 from surface_code import SurfaceLayout
-from dis_surface_code import ClusterNodeProgram
+#from dis_surface_code import ClusterNodeProgram
 from coordinator import CoordinatorProgram
+from dis_surface_code_debug import ClusterNodeProgram
 
 def main():
-    global_size    = 8   # planar surface code with 10x10 qubits (100 qubits total)
-    nodes_per_side = 2   # 2x2 grid of nodes, each node manages a 5x5 subgrid
+    global_size    = 5   # planar surface code with 10x10 qubits (100 qubits total)
+    nodes_per_side = 2   # 3x3 grid of nodes, each node manages a 3x3 subgrid
 
     # Step 1: Create the Surface Layout Manager
     layout_manager = SurfaceLayout(global_size, nodes_per_side)
@@ -29,9 +32,9 @@ def main():
     cfg = create_complete_graph_network(
         node_names=all_node_names,
         link_typ="perfect",
-        link_cfg=PerfectQLinkConfig(state_delay=0),
+        link_cfg=PerfectQLinkConfig(state_delay=100),
         clink_typ="default",
-        clink_cfg=DefaultCLinkConfig(delay=0),
+        clink_cfg=DefaultCLinkConfig(delay=500),
     )
 
     # Step 4: Create programs for each cluster node and coordinator
@@ -75,7 +78,7 @@ def main():
         print(f"SIMULATION COMPLETE ({num_runs} runs)")
         print(f"Failures (Logical Error) : {failures}")
         print(f" Successes: {successes}")
-        print(f"📈 Accuracy: {accuracy:.2f}%")
+        print(f"Accuracy: {accuracy:.2f}%")
 
     except Exception as e:
         print(f"\nError: {e}")
@@ -83,4 +86,10 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    with open('output.txt', 'w') as f:
+        with redirect_stdout(f):
+            main()
+    sim_time_ns = n.sim_time()
+    sim_time_ms = sim_time_ns/1_000_000
+
+    print(f"Execution time: {sim_time_ms} ms")
