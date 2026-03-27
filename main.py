@@ -1,6 +1,7 @@
 import traceback
 from contextlib import redirect_stdout
 import netsquid as n
+import argparse
 
 from squidasm.run.stack.run import run as run_simulation
 from squidasm.util.util import create_complete_graph_network
@@ -8,11 +9,11 @@ from netsquid_netbuilder.modules.qlinks.perfect import PerfectQLinkConfig
 from netsquid_netbuilder.modules.clinks.default import DefaultCLinkConfig
 
 from surface_code import SurfaceLayout
-#from dis_surface_code import ClusterNodeProgram
+from dis_surface_code import ClusterNodeProgram
 from coordinator import CoordinatorProgram
-from dis_surface_code_debug import ClusterNodeProgram
+#from dis_surface_code_debug import ClusterNodeProgram
 
-def main():
+def main(error):
     global_size    = 5   # planar surface code with 10x10 qubits (100 qubits total)
     nodes_per_side = 2   # 3x3 grid of nodes, each node manages a 3x3 subgrid
 
@@ -47,6 +48,7 @@ def main():
                 node_coords=(r, c),
                 layout_manager=layout_manager,
                 coordinator_name=coordinator_name,
+                error = error
             )
 
     programs[coordinator_name] = CoordinatorProgram(
@@ -57,8 +59,7 @@ def main():
     num_runs = 100
     print("Running Distributed Surface Code simulation...")
     print(f"Global grid   : {global_size}x{global_size} qubits")
-    print(f"Cluster nodes : {len(cluster_node_names)} nodes "
-          f"(each manages {layout_manager.block_size}x{layout_manager.block_size} qubits)")
+    print(f"Cluster nodes : {len(cluster_node_names)} nodes ")
     print(f"Decoder       : local SVD compression + global OSD at coordinator")
 
     try:
@@ -86,9 +87,19 @@ def main():
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "-e", "--error", 
+        type=str, 
+        default="identity", 
+        choices=["identity", "hadamard"],
+        help="Type of error (default: %(default)s)"
+    )
+    
+    args = parser.parse_args()
     with open('output.txt', 'w') as f:
         with redirect_stdout(f):
-            main()
+            main(args.error)
     sim_time_ns = n.sim_time()
     sim_time_ms = sim_time_ns/1_000_000
 

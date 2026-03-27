@@ -11,11 +11,12 @@ class ClusterNodeProgram(Program):
     ENERGY_THRESHOLD  = 0.95        # fraction of total energy to retain in SVD dimensionality reduction (0 < threshold <= 1)
     NUM_ROUNDS        = 2           # number of rounds of stabilizer measurements (for spacetime decoding)
 
-    def __init__(self, node_coords: tuple, layout_manager,
+    def __init__(self, node_coords: tuple, layout_manager, error,
                  coordinator_name: str = "coordinator"):
         self.node_coords = node_coords
         self.layout_manager = layout_manager
         self.coordinator_name = coordinator_name
+        self.error = error
 
         r, c = node_coords
         N = layout_manager.nodes_per_side
@@ -44,8 +45,10 @@ class ClusterNodeProgram(Program):
         subgrid_data = self.layout_manager.get_subgrid_for_node(*self.node_coords)
         B  = self.layout_manager.block_size
 
-        self.injected_errors = set()        # Track which data qubits received noise-induced X errors
-        self.applied_corrections = set()    # Track which data qubits received X corrections from the coordinator
+        self.injected_X_errors = set()
+        self.injected_Z_errors = set()
+        self.applied_X_corrections = set()
+        self.applied_Z_corrections = set()
 
         # 1. Allocate qubits
         self.local_qubits, self.qubit_roles = [], []
@@ -82,14 +85,31 @@ class ClusterNodeProgram(Program):
             # Apply noise only before the first round, so that the second round's syndrome reflects the effect of noise + any Z gates from TeleGate.
             if round_idx == 1:
                 # 2. Apply noise
-                for r in range(B):
-                    for c in range(B):
-                        if (self.qubit_roles[r][c] == "pQ"
-                                and random.random() < self.NOISE_PROBABILITY):
-                            self.local_qubits[r][c].X()
-                            self.injected_errors.add((r, c))
-                print(f"[{self.node_coords}] Noise: "
-                f"{len(self.injected_errors) if self.injected_errors else 'none'}")
+                match self.error:
+                    case "identity":
+                        for r in range(B):
+                            for c in range(B):
+                                if (self.qubit_roles[r][c] == "pQ"
+                                        and random.random() < self.NOISE_PROBABILITY):
+                                    self.local_qubits[r][c].X()
+                                    self.injected_X_errors.add((r, c))
+                        print(f"[{self.node_coords}] Noise: "
+                        f"{len(self.injected_X_errors) if self.injected_X_errors else 'none'}")
+                    case "hadamard":
+                        for r in range(B):
+                            for c in range(B):
+                                if self.qubit_roles[r][c]== "pq":
+                                    # simulation a hadamard error
+                                    self._noisy_H(self.local_qubits[r][c], r, c)
+                                    # applay 2 time hadamard, in this way, HIH = I, but we applay error
+                                    self._noisy_H(self.local_qubits[r][c], r, c)
+
+
+                    case "none":
+                        print(f"[{self.node_coords}] Ideal simulation: no noise applied.")
+
+                    case _:
+                        print(f"[{self.node_coords}] WARNING: Unknown error type '{self.error}'. Skipping noise.")
 
             # a) Re-allocate ancillas
             for r in range(B):
@@ -191,8 +211,12 @@ class ClusterNodeProgram(Program):
         self._apply_corrections(corr_X, gate="X")
         self._apply_corrections(corr_Z, gate="Z")
 
-        if self.applied_corrections:
-            print(f"[{self.node_coords}] Corrections: {sorted(self.applied_corrections)}")
+        if self.applied_X_corrections and self.applied_Z_corrections:
+            print(f"[{self.node_coords}] Corrections X: {sorted(self.applied_X_corrections)} Corrections Z: {sorted(self.applied_Z_corrections)}")
+        elif self.applied_Z_corrections:
+            print(f"[{self.node_coords}] Corrections Z: {sorted(self.applied_Z_corrections)}")
+        elif self.applied_X_corrections:
+            print(f"[{self.node_coords}] Corrections X: {sorted(self.applied_X_corrections)}")
         else:
             print(f"[{self.node_coords}] Corrections: none")
 
@@ -502,9 +526,10 @@ class ClusterNodeProgram(Program):
                 if self.qubit_roles[r_local][c_local] == "pQ":
                     if gate == "X":
                         self.local_qubits[r_local][c_local].X()
+                        self.applied_X_corrections.add((r_local, c_local))
                     else:
                         self.local_qubits[r_local][c_local].Z()
-                    self.applied_corrections.add((r_local, c_local))
+                        self.applied_Z_corrections.add((r_local, c_local))
 
     # ------------------------------------------------------------------ #
     #  Logical-Z parity                                                    #
@@ -535,12 +560,56 @@ class ClusterNodeProgram(Program):
             for r in range(B):
                 if self.qubit_roles[r][0] != "pQ":
                     continue
-                if (r, 0) in self.injected_errors:
+                if (r, 0) in self.injected_X_errors:
                     parity ^= 1
                 if x_parity is not None and x_parity[r][0] == 1:
                     parity ^= 1
-                if (r, 0) in self.applied_corrections:
+                if (r, 0) in self.applied_X_corrections:
                     parity ^= 1
             csock.send(json.dumps(parity))
  
         yield from context.connection.flush()
+
+    # ------------------------------------------------------------------ #
+    #  Logical-Z parity                                                    #
+    # ------------------------------------------------------------------ #
+    def _send_logical_X_parity(self, context, z_parity=None):
+        csock = context.csockets[self.coordinator_name]
+        r_node, c_node = self.node_coords
+        B = self.layout_manager.block_size
+
+        if r_node != 0:
+            csock.send(json.dumps(-1))
+        else:
+            parity = 0
+            for c in range(B):
+                if self.qubit_roles[0][c] != "pQ":
+                    continue
+                if (0, c) in self.injected_Z_errors:
+                    parity ^= 1
+                if z_parity is not None and z_parity[0][c] == 1:
+                    parity ^= 1
+                if (0, c) in self.applied_Z_corrections:
+                    parity ^= 1
+            csock.send(json.dumps(parity))
+
+        yield from context.connection.flush()
+
+    def _noisy_H(self, qubit, r, c):
+        """Hadamard noise """
+        qubit.H()
+        
+        # Se l'utente ha scelto l'errore sull'Hadamard e l'errore scatta:
+        if self.error == "hadamard" and random.random() < self.NOISE_PROBABILITY:
+            # Modello depolarizzante post-gate
+            scelta = random.choice(["X", "Y", "Z"])
+            if scelta == "X":
+                qubit.X()
+                self.injected_X_errors.add((r, c))
+            elif scelta == "Y":
+                qubit.Y()
+                self.injected_X_errors.add((r, c))
+                self.injected_Z_errors.add((r, c))
+            elif scelta == "Z":
+                qubit.Z()
+                self.injected_Z_errors.add((r, c))
