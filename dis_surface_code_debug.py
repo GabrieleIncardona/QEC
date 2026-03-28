@@ -98,13 +98,14 @@ class ClusterNodeProgram(Program):
                     case "hadamard":
                         for r in range(B):
                             for c in range(B):
-                                if self.qubit_roles[r][c]== "pq":
+                                if self.qubit_roles[r][c]== "pQ":
                                     # simulation a hadamard error
                                     self._noisy_H(self.local_qubits[r][c], r, c)
                                     # applay 2 time hadamard, in this way, HIH = I, but we applay error
                                     self._noisy_H(self.local_qubits[r][c], r, c)
 
-
+                    case "readout":
+                        print(f"[{self.node_coords}] Readout error: simulating by flipping all ancilla measurements in round 2.")
                     case "none":
                         print(f"[{self.node_coords}] Ideal simulation: no noise applied.")
 
@@ -114,8 +115,21 @@ class ClusterNodeProgram(Program):
             # a) Re-allocate ancillas
             for r in range(B):
                 for c in range(B):
-                    if self.qubit_roles[r][c] in ("xQ", "zQ"):
-                        self.local_qubits[r][c] = Qubit(conn)
+                    role = self.qubit_roles[r][c]
+                    if role in ("xQ", "zQ"):
+                        ancilla = Qubit(conn)
+                        
+                        # Add error on ancilla initialization if the user selected it and the error occurs:
+                        if self.error == "initialization" and random.random() < self.NOISE_PROBABILITY:
+                            # For simplicity, we model ancilla initialization error as an X error for zQ ancillas and a Z error for xQ ancillas. This means the ancilla starts in the wrong state (|1⟩ instead of |0⟩ for zQ, or |−⟩ instead of |+⟩ for xQ), which will flip the measurement outcome and simulate a readout error.
+                            if role == "zQ":
+                                ancilla.X()
+                                print(f"[{self.node_coords}] Noise: X error on zQ ancilla at ({r}, {c})")
+                            else:
+                                ancilla.Z()
+                                print(f"[{self.node_coords}] Noise: Z error on xQ ancilla at ({r}, {c})")
+                        
+                        self.local_qubits[r][c] = ancilla
 
             # b) Local gates
             for r in range(B):
@@ -228,6 +242,8 @@ class ClusterNodeProgram(Program):
     #  TeleGate border protocol                                            #
     # ------------------------------------------------------------------ #
     def _teleported_cnot_borders(self, context):
+        if self.neighbors == []:
+            return set(), set(), set()  # No neighbors → no TeleGate interactions → no Z or X gates applied, no teleported flips
         r_node, c_node = self.node_coords
         N = self.layout_manager.nodes_per_side
         B = self.layout_manager.block_size
@@ -615,10 +631,18 @@ class ClusterNodeProgram(Program):
             if scelta == "X":
                 qubit.X()
                 self.injected_X_errors.add((r, c))
+                print(f"[{self.node_coords}] Noise: "
+                        f"{len(self.injected_X_errors) if self.injected_X_errors else 'none'}")
             elif scelta == "Y":
                 qubit.Y()
                 self.injected_X_errors.add((r, c))
+                print(f"[{self.node_coords}] Noise: "
+                        f"{len(self.injected_X_errors) if self.injected_X_errors else 'none'}")
                 self.injected_Z_errors.add((r, c))
+                print(f"[{self.node_coords}] Noise: "
+                        f"{len(self.injected_Z_errors) if self.injected_Z_errors else 'none'}")
             elif scelta == "Z":
                 qubit.Z()
                 self.injected_Z_errors.add((r, c))
+                print(f"[{self.node_coords}] Noise: "
+                        f"{len(self.injected_Z_errors) if self.injected_Z_errors else 'none'}")
