@@ -49,6 +49,11 @@ class ClusterNodeProgram(Program):
         self.injected_Z_errors = set()
         self.applied_X_corrections = set()
         self.applied_Z_corrections = set()
+        self.errors = set()
+        if self.error == "all":
+            self.errors = {"identity", "hadamard","initialization","readout","cnot"}
+        else:
+            self.errors = {self.error}
 
         # 1. Allocate qubits
         self.local_qubits, self.qubit_roles = [], []
@@ -85,37 +90,38 @@ class ClusterNodeProgram(Program):
             # Apply noise only before the first round, so that the second round's syndrome reflects the effect of noise + any Z gates from TeleGate.
             if round_idx == 1:
                 # 2. Apply noise
-                match self.error:
-                    case "identity":
-                        for r in range(B):
-                            for c in range(B):
-                                if (self.qubit_roles[r][c] == "pQ"
-                                        and random.random() < self.NOISE_PROBABILITY):
-                                    self.local_qubits[r][c].X()
-                                    self.injected_X_errors.add((r, c))
-                        print(f"[{self.node_coords}] Noise: "
-                        f"{len(self.injected_X_errors) if self.injected_X_errors else 'none'}")
-                    case "hadamard":
-                        for r in range(B):
-                            for c in range(B):
-                                if self.qubit_roles[r][c]== "pQ":
-                                    # simulation a hadamard error
-                                    self._noisy_H(self.local_qubits[r][c], r, c)
-                                    # applay 2 time hadamard, in this way, HIH = I, but we applay error
-                                    self._noisy_H(self.local_qubits[r][c], r, c)
+                for error in self.errors:
+                    match error:
+                        case "identity":
+                            for r in range(B):
+                                for c in range(B):
+                                    if (self.qubit_roles[r][c] == "pQ"
+                                            and random.random() < self.NOISE_PROBABILITY):
+                                        self.local_qubits[r][c].X()
+                                        self.injected_X_errors.add((r, c))
+                            print(f"[{self.node_coords}] Noise: "
+                            f"{len(self.injected_X_errors) if self.injected_X_errors else 'none'}")
+                        case "hadamard":
+                            for r in range(B):
+                                for c in range(B):
+                                    if self.qubit_roles[r][c]== "pQ":
+                                        # simulation a hadamard error
+                                        self._noisy_H(self.local_qubits[r][c], r, c)
+                                        # applay 2 time hadamard, in this way, HIH = I, but we applay error
+                                        self._noisy_H(self.local_qubits[r][c], r, c)
 
-                    case "initialization":
-                        print(f"[{self.node_coords}] initialization error: simulating by flipping all ancilla measurements in round 2.")
-                    
-                    case "readout":
-                        print(f"[{self.node_coords}] readout error: simulating by flipping all ancilla measurements in round 2 with probability {self.NOISE_PROBABILITY}.")
+                        case "initialization":
+                            print(f"[{self.node_coords}] initialization error: simulating by flipping all ancilla measurements in round 2.")
+                        
+                        case "readout":
+                            print(f"[{self.node_coords}] readout error: simulating by flipping all ancilla measurements in round 2 with probability {self.NOISE_PROBABILITY}.")
 
-                    case "cnot":
-                        print(f"[{self.node_coords}] CNOT error: simulating by applying a random X error to the target of each CNOT with probability {self.NOISE_PROBABILITY}.")
-                    case "none":
-                        print(f"[{self.node_coords}] Ideal simulation: no noise applied.")
-                    case _:
-                        print(f"[{self.node_coords}] WARNING: Unknown error type '{self.error}'. Skipping noise.")
+                        case "cnot":
+                            print(f"[{self.node_coords}] CNOT error: simulating by applying a random X error to the target of each CNOT with probability {self.NOISE_PROBABILITY}.")
+                        case "none":
+                            print(f"[{self.node_coords}] Ideal simulation: no noise applied.")
+                        case _:
+                            print(f"[{self.node_coords}] WARNING: Unknown error type '{self.error}'. Skipping noise.")
 
             # a) Re-allocate ancillas
             for r in range(B):
@@ -125,7 +131,7 @@ class ClusterNodeProgram(Program):
                         ancilla = Qubit(conn)
                         
                         # Add error on ancilla initialization if the user selected it and the error occurs:
-                        if self.error == "initialization" and random.random() < self.NOISE_PROBABILITY and round_idx == 1:
+                        if (self.error == "initialization" or self.error == "all") and random.random() < self.NOISE_PROBABILITY and round_idx == 1:
                             # For simplicity, we model ancilla initialization error as an X error for zQ ancillas and a Z error for xQ ancillas. This means the ancilla starts in the wrong state (|1⟩ instead of |0⟩ for zQ, or |−⟩ instead of |+⟩ for xQ), which will flip the measurement outcome and simulate a inizialization error.
                             if role == "zQ":
                                 ancilla.X()
@@ -187,7 +193,7 @@ class ClusterNodeProgram(Program):
                     yield from conn.flush()
 
                     # 2. Applay readout error if the user selected it and the error occurs:
-                    if self.error == "readout" and random.random() < self.NOISE_PROBABILITY and round_idx == 1:
+                    if (self.error == "readout" or self.error == "all") and random.random() < self.NOISE_PROBABILITY and round_idx == 1:
                         m = 1 - m  # flip the measurement result
                         print(f"[{self.node_coords}] Error flip at: ({r}, {c})")
                     raw = int(m)
@@ -641,7 +647,7 @@ class ClusterNodeProgram(Program):
         """Hadamard noise """
         qubit.H()
 
-        if self.error == "hadamard" and random.random() < self.NOISE_PROBABILITY:
+        if (self.error == "hadamard" or self.error == "all") and random.random() < self.NOISE_PROBABILITY:
             # Deporalization error: randomly choose between X, Y, Z error with equal probability
             choice = random.choice(["X", "Y", "Z"])
             if choice == "X":
@@ -667,7 +673,7 @@ class ClusterNodeProgram(Program):
     def _noise_cnot(self, qubit1, qubit2, coords1, coords2, round_idx=None):
         qubit1.cnot(qubit2)
 
-        if self.error == "cnot" and random.random() < self.NOISE_PROBABILITY and round_idx == 1:
+        if (self.error == "cnot" or self.error == "all") and random.random() < self.NOISE_PROBABILITY and round_idx == 1:
             qubits_and_coords = [(qubit1, coords1), (qubit2, coords2)]
 
             for qb, coords in qubits_and_coords:
