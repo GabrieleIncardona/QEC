@@ -104,11 +104,16 @@ class ClusterNodeProgram(Program):
                                     # applay 2 time hadamard, in this way, HIH = I, but we applay error
                                     self._noisy_H(self.local_qubits[r][c], r, c)
 
+                    case "initialization":
+                        print(f"[{self.node_coords}] initialization error: simulating by flipping all ancilla measurements in round 2.")
+                    
                     case "readout":
-                        print(f"[{self.node_coords}] Readout error: simulating by flipping all ancilla measurements in round 2.")
+                        print(f"[{self.node_coords}] readout error: simulating by flipping all ancilla measurements in round 2 with probability {self.NOISE_PROBABILITY}.")
+
+                    case "cnot":
+                        print(f"[{self.node_coords}] CNOT error: simulating by applying a random X error to the target of each CNOT with probability {self.NOISE_PROBABILITY}.")
                     case "none":
                         print(f"[{self.node_coords}] Ideal simulation: no noise applied.")
-
                     case _:
                         print(f"[{self.node_coords}] WARNING: Unknown error type '{self.error}'. Skipping noise.")
 
@@ -120,8 +125,8 @@ class ClusterNodeProgram(Program):
                         ancilla = Qubit(conn)
                         
                         # Add error on ancilla initialization if the user selected it and the error occurs:
-                        if self.error == "initialization" and random.random() < self.NOISE_PROBABILITY:
-                            # For simplicity, we model ancilla initialization error as an X error for zQ ancillas and a Z error for xQ ancillas. This means the ancilla starts in the wrong state (|1⟩ instead of |0⟩ for zQ, or |−⟩ instead of |+⟩ for xQ), which will flip the measurement outcome and simulate a readout error.
+                        if self.error == "initialization" and random.random() < self.NOISE_PROBABILITY and round_idx == 1:
+                            # For simplicity, we model ancilla initialization error as an X error for zQ ancillas and a Z error for xQ ancillas. This means the ancilla starts in the wrong state (|1⟩ instead of |0⟩ for zQ, or |−⟩ instead of |+⟩ for xQ), which will flip the measurement outcome and simulate a inizialization error.
                             if role == "zQ":
                                 ancilla.X()
                                 print(f"[{self.node_coords}] Noise: X error on zQ ancilla at ({r}, {c})")
@@ -146,13 +151,13 @@ class ClusterNodeProgram(Program):
                                 and self.qubit_roles[nr][nc] == "pQ"):
                             data = self.local_qubits[nr][nc]
                             if role == "xQ":
-                                ancilla.cnot(data)
+                                self._noise_cnot(ancilla, data, (r, c), (nr, nc), round_idx)
                             else:
-                                data.cnot(ancilla)
+                                self._noise_cnot(data, ancilla, (r, c), (nr, nc), round_idx)
             yield from conn.flush()
 
             # c) Original TeleGate protocol — returns Z gates applied this round
-            round_z, round_x, round_tf = yield from self._teleported_cnot_borders(context)
+            round_z, round_x, round_tf = yield from self._teleported_cnot_borders(context, round_idx=round_idx)
 
             # d) Update parity registers
             for (r, c) in round_z:
@@ -175,8 +180,16 @@ class ClusterNodeProgram(Program):
                     ancilla = self.local_qubits[r][c]
                     if role == "xQ":
                         ancilla.H()
+
+                    # 1. Measure the ancilla. If the user selected readout error and it occurs, we flip the measurement result to simulate a readout error.
                     m = ancilla.measure()
+
                     yield from conn.flush()
+
+                    # 2. Applay readout error if the user selected it and the error occurs:
+                    if self.error == "readout" and random.random() < self.NOISE_PROBABILITY and round_idx == 1:
+                        m = 1 - m  # flip the measurement result
+                        print(f"[{self.node_coords}] Error flip at: ({r}, {c})")
                     raw = int(m)
 
                     # Z compensation for xQ: Z anticommutes with X
@@ -241,7 +254,7 @@ class ClusterNodeProgram(Program):
     # ------------------------------------------------------------------ #
     #  TeleGate border protocol                                            #
     # ------------------------------------------------------------------ #
-    def _teleported_cnot_borders(self, context):
+    def _teleported_cnot_borders(self, context, round_idx=None):
         if self.neighbors == []:
             return set(), set(), set()  # No neighbors → no TeleGate interactions → no Z or X gates applied, no teleported flips
         r_node, c_node = self.node_coords
@@ -256,12 +269,14 @@ class ClusterNodeProgram(Program):
                 z_set, x_set, tf_set = yield from self._run_border_direction(
                     context, neighbor=f"node_{r_node}_{c_node + 1}",
                     is_ancilla_side=True, axis="col", local_fixed=B - 1,
+                    round_idx=round_idx,
                 )
                 round_z ^= z_set; round_x ^= x_set; round_tf ^= tf_set
             elif c_node == c + 1:
                 z_set, x_set, tf_set = yield from self._run_border_direction(
                     context, neighbor=f"node_{r_node}_{c_node - 1}",
                     is_ancilla_side=False, axis="col", local_fixed=0,
+                    round_idx=round_idx,
                 )
                 round_z ^= z_set; round_x ^= x_set; round_tf ^= tf_set
 
@@ -270,12 +285,14 @@ class ClusterNodeProgram(Program):
                 z_set, x_set, tf_set = yield from self._run_border_direction(
                     context, neighbor=f"node_{r_node + 1}_{c_node}",
                     is_ancilla_side=True, axis="row", local_fixed=B - 1,
+                    round_idx=round_idx,
                 )
                 round_z ^= z_set; round_x ^= x_set; round_tf ^= tf_set
             elif r_node == r + 1:
                 z_set, x_set, tf_set = yield from self._run_border_direction(
                     context, neighbor=f"node_{r_node - 1}_{c_node}",
                     is_ancilla_side=False, axis="row", local_fixed=0,
+                    round_idx=round_idx,
                 )
                 round_z ^= z_set; round_x ^= x_set; round_tf ^= tf_set
 
@@ -283,7 +300,7 @@ class ClusterNodeProgram(Program):
 
     def _run_border_direction(self, context, *, neighbor: str,
                                is_ancilla_side: bool, axis: str,
-                               local_fixed: int):
+                               local_fixed: int, round_idx=None):
         """
         Original TeleGate Cat-Ent/Cat-DisEnt protocol.
         Returns z_applied: set of (r_loc, c_loc) coordinates of local data qubits
@@ -363,7 +380,7 @@ class ClusterNodeProgram(Program):
                 yield from conn.flush()
 
                 if role_signal == "xQ":
-                    ancilla.cnot(eA)
+                    self._noise_cnot(ancilla, eA, (r_loc, c_loc), None, round_idx)
                     m_A = eA.measure()
                     yield from conn.flush()
                     csock.send(str(int(m_A)))
@@ -377,7 +394,7 @@ class ClusterNodeProgram(Program):
                     m_B = int((yield from csock.recv()))
                     if m_B == 1:
                         eA.X()
-                    eA.cnot(ancilla)
+                    self._noise_cnot(eA, ancilla,None, (r_loc, c_loc), round_idx)
                     eA.H()
                     m_A = eA.measure()
                     yield from conn.flush()
@@ -405,7 +422,7 @@ class ClusterNodeProgram(Program):
                     if m_A == 1:
                         #x_applied.add((r_loc, c_loc))
                         eB.X()
-                    eB.cnot(data)
+                    self._noise_cnot(eB, data, None, (r_loc, c_loc), round_idx)
                     eB.H()
                     m_B = eB.measure()
                     yield from conn.flush()
@@ -413,7 +430,7 @@ class ClusterNodeProgram(Program):
                     yield from conn.flush()
 
                 else:  # zQ
-                    data.cnot(eB)
+                    self._noise_cnot(data, eB, None, (r_loc, c_loc), round_idx)
                     m_B = eB.measure()
                     yield from conn.flush()
                     csock.send(str(int(m_B)))
@@ -596,7 +613,7 @@ class ClusterNodeProgram(Program):
         yield from context.connection.flush()
 
     # ------------------------------------------------------------------ #
-    #  Logical-Z parity                                                    #
+    #  Logical-X parity                                                    #
     # ------------------------------------------------------------------ #
     def _send_logical_X_parity(self, context, z_parity=None):
         csock = context.csockets[self.coordinator_name]
@@ -623,17 +640,16 @@ class ClusterNodeProgram(Program):
     def _noisy_H(self, qubit, r, c):
         """Hadamard noise """
         qubit.H()
-        
-        # Se l'utente ha scelto l'errore sull'Hadamard e l'errore scatta:
+
         if self.error == "hadamard" and random.random() < self.NOISE_PROBABILITY:
-            # Modello depolarizzante post-gate
-            scelta = random.choice(["X", "Y", "Z"])
-            if scelta == "X":
+            # Deporalization error: randomly choose between X, Y, Z error with equal probability
+            choice = random.choice(["X", "Y", "Z"])
+            if choice == "X":
                 qubit.X()
                 self.injected_X_errors.add((r, c))
                 print(f"[{self.node_coords}] Noise: "
                         f"{len(self.injected_X_errors) if self.injected_X_errors else 'none'}")
-            elif scelta == "Y":
+            elif choice == "Y":
                 qubit.Y()
                 self.injected_X_errors.add((r, c))
                 print(f"[{self.node_coords}] Noise: "
@@ -641,8 +657,45 @@ class ClusterNodeProgram(Program):
                 self.injected_Z_errors.add((r, c))
                 print(f"[{self.node_coords}] Noise: "
                         f"{len(self.injected_Z_errors) if self.injected_Z_errors else 'none'}")
-            elif scelta == "Z":
+            elif choice == "Z":
                 qubit.Z()
                 self.injected_Z_errors.add((r, c))
                 print(f"[{self.node_coords}] Noise: "
                         f"{len(self.injected_Z_errors) if self.injected_Z_errors else 'none'}")
+
+
+    def _noise_cnot(self, qubit1, qubit2, coords1, coords2, round_idx=None):
+        qubit1.cnot(qubit2)
+
+        if self.error == "cnot" and random.random() < self.NOISE_PROBABILITY and round_idx == 1:
+            qubits_and_coords = [(qubit1, coords1), (qubit2, coords2)]
+
+            for qb, coords in qubits_and_coords:
+                choice = random.choice(["X", "Y", "Z", "I"])
+
+                def toggle_error(error_set, pos):
+                    if pos in error_set:
+                        error_set.remove(pos)
+                    else:
+                        error_set.add(pos)
+
+                is_local_data = (
+                    coords is not None
+                    and 0 <= coords[0] < self.layout_manager.block_size
+                    and 0 <= coords[1] < self.layout_manager.block_size
+                    and self.qubit_roles[coords[0]][coords[1]] == "pQ"
+                )
+
+                if choice in ["X", "Y"]:
+                    qb.X()
+                    if is_local_data:
+                        toggle_error(self.injected_X_errors, coords)
+
+                if choice in ["Z", "Y"]:
+                    qb.Z()
+                    if is_local_data:
+                        toggle_error(self.injected_Z_errors, coords)
+
+            print(f"[{self.node_coords}] CNOT Noise applied. "
+                f"X errors: {len(self.injected_X_errors)}, "
+                f"Z errors: {len(self.injected_Z_errors)}")

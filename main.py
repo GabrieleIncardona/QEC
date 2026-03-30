@@ -9,9 +9,9 @@ from netsquid_netbuilder.modules.qlinks.perfect import PerfectQLinkConfig
 from netsquid_netbuilder.modules.clinks.default import DefaultCLinkConfig
 
 from surface_code import SurfaceLayout
-#from dis_surface_code import ClusterNodeProgram
+from dis_surface_code import ClusterNodeProgram
 from coordinator import CoordinatorProgram
-from dis_surface_code_debug import ClusterNodeProgram
+#from dis_surface_code_debug import ClusterNodeProgram
 
 def main(error):
     global_size    = 5   # planar surface code with 10x10 qubits (100 qubits total)
@@ -92,7 +92,7 @@ if __name__ == "__main__":
         "-e", "--error", 
         type=str, 
         default="identity", 
-        choices=["identity", "hadamard","readout"],
+        choices=["identity", "hadamard","initialization","readout","cnot"],
         help="Type of error (default: %(default)s)"
     )
     
