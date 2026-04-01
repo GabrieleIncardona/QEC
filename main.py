@@ -11,9 +11,10 @@ from netsquid_netbuilder.modules.clinks.default import DefaultCLinkConfig
 from surface_code import SurfaceLayout
 #from dis_surface_code import ClusterNodeProgram
 from coordinator import CoordinatorProgram
-from dis_surface_code_debug import ClusterNodeProgram
+#from dis_surface_code_debug import ClusterNodeProgram
+from dis_surface_mesure import ClusterNodeProgram
 
-def main(error):
+def main(error, prob):
     global_size    = 5   # planar surface code with 10x10 qubits (100 qubits total)
     nodes_per_side = 2   # 3x3 grid of nodes, each node manages a 3x3 subgrid
 
@@ -48,7 +49,8 @@ def main(error):
                 node_coords=(r, c),
                 layout_manager=layout_manager,
                 coordinator_name=coordinator_name,
-                error = error
+                error = error,
+                prob = prob
             )
 
     programs[coordinator_name] = CoordinatorProgram(
@@ -95,11 +97,16 @@ if __name__ == "__main__":
         choices=["identity", "hadamard","initialization","readout","cnot", "all"],
         help="Type of error (default: %(default)s)"
     )
-    
+    parser.add_argument(
+        "-p", "--prob",
+        type=float,
+        default=0.01,
+        help="Error probability (default: %(default)s)"
+    )
     args = parser.parse_args()
     with open('output.txt', 'w') as f:
         with redirect_stdout(f):
-            main(args.error)
+            main(args.error, args.prob)
     sim_time_ns = n.sim_time()
     sim_time_ms = sim_time_ns/1_000_000
 

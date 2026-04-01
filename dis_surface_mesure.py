@@ -157,9 +157,13 @@ class ClusterNodeProgram(Program):
                                 and self.qubit_roles[nr][nc] == "pQ"):
                             data = self.local_qubits[nr][nc]
                             if role == "xQ":
-                                self._noise_cnot(ancilla, data, (r, c), (nr, nc), round_idx)
+                                # X stabilizer: data is control, ancilla is target.
+                                # CNOT(data→ancilla) measures X parity without disturbing data qubits.
+                                self._noise_cnot(data, ancilla, (nr, nc), (r, c), round_idx)
                             else:
-                                self._noise_cnot(data, ancilla, (r, c), (nr, nc), round_idx)
+                                # Z stabilizer: ancilla is control, data is target.
+                                # CNOT(ancilla→data) measures Z parity without disturbing data qubits.
+                                self._noise_cnot(ancilla, data, (r, c), (nr, nc), round_idx)
             yield from conn.flush()
 
             # c) Original TeleGate protocol — returns Z gates applied this round
@@ -243,6 +247,7 @@ class ClusterNodeProgram(Program):
         corr_X, corr_Z = yield from self._communicate_with_coordinator(context, payload_X, payload_Z)
         self._apply_corrections(corr_X, gate="X")
         self._apply_corrections(corr_Z, gate="Z")
+        yield from conn.flush()   # materialise correction gates before measurement
 
         if self.applied_X_corrections and self.applied_Z_corrections:
             print(f"[{self.node_coords}] Corrections X: {sorted(self.applied_X_corrections)} Corrections Z: {sorted(self.applied_Z_corrections)}")
@@ -428,7 +433,7 @@ class ClusterNodeProgram(Program):
                     if m_A == 1:
                         #x_applied.add((r_loc, c_loc))
                         eB.X()
-                    self._noise_cnot(eB, data, None, (r_loc, c_loc), round_idx)
+                    self._noise_cnot(data, eB, (r_loc, c_loc), None, round_idx)  # X-stab: data→eB
                     eB.H()
                     m_B = eB.measure()
                     yield from conn.flush()
@@ -436,7 +441,7 @@ class ClusterNodeProgram(Program):
                     yield from conn.flush()
 
                 else:  # zQ
-                    self._noise_cnot(data, eB, None, (r_loc, c_loc), round_idx)
+                    self._noise_cnot(eB, data, None, (r_loc, c_loc), round_idx)  # Z-stab: eB→data
                     m_B = eB.measure()
                     yield from conn.flush()
                     csock.send(str(int(m_B)))
@@ -584,23 +589,23 @@ class ClusterNodeProgram(Program):
     # ------------------------------------------------------------------ #
     def _send_logical_parity(self, context, x_parity=None):
         """
-        Compute the logical-Z parity classically.
- 
-        Z̄ = XOR of all X gates ever applied to data qubits on column 0.
-        Three sources contribute:
-          1. Noise-induced X errors      → self.injected_errors
-          2. TeleGate X byproducts       → x_parity[r][0]
-          3. Coordinator X corrections   → self.applied_corrections
- 
-        If the decoder is perfect: corrections cancel noise exactly,
-        so (1) XOR (3) = 0, and the only residual is (2).
-        If a logical error survives: (1) XOR (3) = 1 on the logical string,
-        so parity = 1 (possibly XOR'd with the TeleGate contribution).
+        Compute the logical-Z parity via physical Z-basis measurements.
+
+        Z̄ = tensor product of Z on all data qubits along the leftmost column
+        of the global grid (local column 0 of nodes with c_node == 0).
+
+        With correct CNOT directions (CNOT(data→ancilla) for xQ stabilizers),
+        data qubits are never disturbed by stabilizer measurements. After
+        corrections they should be back in |0⟩ (parity 0) if decoding
+        succeeded, or flipped (parity 1) if a logical error remains.
+
+        x_parity is accepted for API compatibility but ignored: the physical
+        measurement already captures all byproduct X gates on the data qubits.
         """
         csock = context.csockets[self.coordinator_name]
         r_node, c_node = self.node_coords
         B = self.layout_manager.block_size
- 
+
         if c_node != 0:
             csock.send(json.dumps(-1))
         else:
@@ -608,20 +613,33 @@ class ClusterNodeProgram(Program):
             for r in range(B):
                 if self.qubit_roles[r][0] != "pQ":
                     continue
-                if (r, 0) in self.injected_X_errors:
-                    parity ^= 1
-                if x_parity is not None and x_parity[r][0] == 1:
-                    parity ^= 1
-                if (r, 0) in self.applied_X_corrections:
-                    parity ^= 1
+                outcome = self.local_qubits[r][0].measure()
+                yield from context.connection.flush()
+                parity ^= int(outcome)
+
+            print(f"[{self.node_coords}] Logical-Z physical parity = {parity}")
             csock.send(json.dumps(parity))
- 
+
         yield from context.connection.flush()
 
     # ------------------------------------------------------------------ #
     #  Logical-X parity                                                    #
     # ------------------------------------------------------------------ #
     def _send_logical_X_parity(self, context, z_parity=None):
+        """
+        Compute the logical-X parity via physical X-basis measurements.
+
+        X̄ = tensor product of X on all data qubits along the top row of the
+        global grid (local row 0 of nodes with r_node == 0).
+
+        Measuring in the X basis = apply H then measure in Z.
+        With correct CNOT directions, data qubits are undisturbed by
+        stabilizer measurements. After Z corrections they should be back
+        in |+⟩ (X-parity 0) if decoding succeeded, or in |−⟩ (parity 1)
+        if a logical Z error remains.
+
+        z_parity is accepted for API compatibility but ignored.
+        """
         csock = context.csockets[self.coordinator_name]
         r_node, c_node = self.node_coords
         B = self.layout_manager.block_size
@@ -633,12 +651,13 @@ class ClusterNodeProgram(Program):
             for c in range(B):
                 if self.qubit_roles[0][c] != "pQ":
                     continue
-                if (0, c) in self.injected_Z_errors:
-                    parity ^= 1
-                if z_parity is not None and z_parity[0][c] == 1:
-                    parity ^= 1
-                if (0, c) in self.applied_Z_corrections:
-                    parity ^= 1
+                # Measure in X basis: H then measure in Z
+                self.local_qubits[0][c].H()
+                outcome = self.local_qubits[0][c].measure()
+                yield from context.connection.flush()
+                parity ^= int(outcome)
+
+            print(f"[{self.node_coords}] Logical-X physical parity = {parity}")
             csock.send(json.dumps(parity))
 
         yield from context.connection.flush()
