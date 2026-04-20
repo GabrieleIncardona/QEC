@@ -9,10 +9,10 @@ from netsquid_netbuilder.modules.qlinks.perfect import PerfectQLinkConfig
 from netsquid_netbuilder.modules.clinks.default import DefaultCLinkConfig
 
 from surface_code import SurfaceLayout
-#from dis_surface_code import ClusterNodeProgram
 from coordinator import CoordinatorProgram
-#from dis_surface_code_debug import ClusterNodeProgram
 from dis_surface_mesure import ClusterNodeProgram
+
+n.set_qstate_formalism(n.QFormalism.STAB)
 
 def main(error, prob):
     global_size    = 5   # planar surface code with 10x10 qubits (100 qubits total)

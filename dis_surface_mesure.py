@@ -7,7 +7,7 @@ from netqasm.sdk.qubit import Qubit
 
 
 class ClusterNodeProgram(Program):
-    ENERGY_THRESHOLD  = 0.95        # fraction of total energy to retain in SVD dimensionality reduction (0 < threshold <= 1)
+    ENERGY_THRESHOLD  = 1.0       # fraction of total energy to retain in SVD dimensionality reduction (0 < threshold <= 1)
     NUM_ROUNDS        = 2           # number of rounds of stabilizer measurements (for spacetime decoding)
 
     def __init__(self, node_coords: tuple, layout_manager, error, prob,
@@ -30,11 +30,17 @@ class ClusterNodeProgram(Program):
     @property
     def meta(self) -> ProgramMeta:
         B = self.layout_manager.block_size
+        subgrid_data = self.layout_manager.get_subgrid_for_node(*self.node_coords)
+        actual_rows = len(subgrid_data)
+        actual_cols = len(subgrid_data[0]) if subgrid_data else B
+        # print(f"{self.node_coords} subgrid size: {actual_rows} rows x {actual_cols} cols")
+        actual_qubits = actual_rows * actual_cols
+        border_eprs = max(actual_rows, actual_cols)  # max EPR qubits on one border
         return ProgramMeta(
             name = f"node_{self.node_coords[0]}_{self.node_coords[1]}",
             csockets = self.neighbors + [self.coordinator_name],
             epr_sockets = self.neighbors,
-            max_qubits  = B * B + B,    # Max qubits needed: all phisical qubits (B^2) + all epr qubit on one border (B) for TeleGate protocol
+            max_qubits  = actual_qubits + border_eprs,
         )
 
     # ------------------------------------------------------------------ #
@@ -43,7 +49,8 @@ class ClusterNodeProgram(Program):
     def run(self, context: ProgramContext):
         conn = context.connection
         subgrid_data = self.layout_manager.get_subgrid_for_node(*self.node_coords)
-        B  = self.layout_manager.block_size
+        self.B_rows = len(subgrid_data)
+        self.B_cols = len(subgrid_data[0]) if subgrid_data else self.layout_manager.block_size
 
         self.injected_X_errors = set()
         self.injected_Z_errors = set()
@@ -81,8 +88,8 @@ class ClusterNodeProgram(Program):
         #   0 = even number of Z gates (no net effect)
         #   1 = odd number of Z gates (equivalent to active Z gate)
 
-        z_parity = [[0] * B for _ in range(B)]  # Classical register tracking Z gates
-        x_parity = [[0] * B for _ in range(B)]  # Classical register tracking X gates
+        z_parity = [[0] * self.B_cols for _ in range(self.B_rows)]  # Classical register tracking Z gates
+        x_parity = [[0] * self.B_cols for _ in range(self.B_rows)]  # Classical register tracking X gates
         tele_flip = {}   # (r,c) → parity of Z() byproducts on xQ ancilla: flips X-basis syndrome
         all_round_syndromes = []
 
@@ -93,8 +100,8 @@ class ClusterNodeProgram(Program):
                 for error in self.errors:
                     match error:
                         case "identity":
-                            for r in range(B):
-                                for c in range(B):
+                            for r in range(self.B_rows):
+                                for c in range(self.B_cols):
                                     if (self.qubit_roles[r][c] == "pQ"
                                             and random.random() < self.NOISE_PROBABILITY):
                                         self.local_qubits[r][c].X()
@@ -102,8 +109,8 @@ class ClusterNodeProgram(Program):
                             print(f"[{self.node_coords}] Noise: "
                             f"{len(self.injected_X_errors) if self.injected_X_errors else 'none'}")
                         case "hadamard":
-                            for r in range(B):
-                                for c in range(B):
+                            for r in range(self.B_rows):
+                                for c in range(self.B_cols):
                                     if self.qubit_roles[r][c]== "pQ":
                                         # simulation a hadamard error
                                         self._noisy_H(self.local_qubits[r][c], r, c)
@@ -124,8 +131,8 @@ class ClusterNodeProgram(Program):
                             print(f"[{self.node_coords}] WARNING: Unknown error type '{self.error}'. Skipping noise.")
 
             # a) Re-allocate ancillas
-            for r in range(B):
-                for c in range(B):
+            for r in range(self.B_rows):
+                for c in range(self.B_cols):
                     role = self.qubit_roles[r][c]
                     if role in ("xQ", "zQ"):
                         ancilla = Qubit(conn)
@@ -143,8 +150,8 @@ class ClusterNodeProgram(Program):
                         self.local_qubits[r][c] = ancilla
 
             # b) Local gates
-            for r in range(B):
-                for c in range(B):
+            for r in range(self.B_rows):
+                for c in range(self.B_cols):
                     role = self.qubit_roles[r][c]
                     if role not in ("xQ", "zQ"):        # Only ancillas participate in local gates; data qubits are idle (except for Z gates from TeleGate border protocol, which are handled separately and tracked in z_parity)
                         continue
@@ -153,16 +160,19 @@ class ClusterNodeProgram(Program):
                         ancilla.H()                     # Prepare xQ ancillas in |+⟩ for X parity measurement    
                     for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:       # local CNOT with neighboring data qubits
                         nr, nc = r + dr, c + dc
-                        if (0 <= nr < B and 0 <= nc < B
+                        if (0 <= nr < self.B_rows and 0 <= nc < self.B_cols
                                 and self.qubit_roles[nr][nc] == "pQ"):
                             data = self.local_qubits[nr][nc]
                             if role == "xQ":
                                 # X stabilizer: data is control, ancilla is target.
-                                # CNOT(data→ancilla) measures X parity without disturbing data qubits.
+                                # CNOT(data→ancilla): ancilla in |+⟩ accumulates X parity of neighbors.
+                                # Data qubit is the control → not disturbed.
+                                # FIX: data is control, ancilla is target for X stabilizer
                                 self._noise_cnot(data, ancilla, (nr, nc), (r, c), round_idx)
                             else:
                                 # Z stabilizer: ancilla is control, data is target.
-                                # CNOT(ancilla→data) measures Z parity without disturbing data qubits.
+                                # CNOT(ancilla->data): measures Z parity correctly.
+                                # FIX: ancilla is control, data is target for Z stabilizer
                                 self._noise_cnot(ancilla, data, (r, c), (nr, nc), round_idx)
             yield from conn.flush()
 
@@ -182,8 +192,8 @@ class ClusterNodeProgram(Program):
             # its measurement in the X basis will be flipped → we compensate by XORing
             # the result with the contribution from each Z-active neighbor.
             round_syndrome = {}
-            for r in range(B):
-                for c in range(B):
+            for r in range(self.B_rows):
+                for c in range(self.B_cols):
                     role = self.qubit_roles[r][c]
                     if role not in ("xQ", "zQ"):
                         continue
@@ -209,7 +219,7 @@ class ClusterNodeProgram(Program):
                         z_flip = 0
                         for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
                             nr, nc = r + dr, c + dc
-                            if (0 <= nr < B and 0 <= nc < B
+                            if (0 <= nr < self.B_rows and 0 <= nc < self.B_cols
                                     and self.qubit_roles[nr][nc] == "pQ"
                                     and z_parity[nr][nc] == 1):
                                 z_flip ^= 1
@@ -219,7 +229,7 @@ class ClusterNodeProgram(Program):
                         x_flip = 0
                         for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
                             nr, nc = r + dr, c + dc
-                            if (0 <= nr < B and 0 <= nc < B 
+                            if (0 <= nr < self.B_rows and 0 <= nc < self.B_cols 
                                 and self.qubit_roles[nr][nc] == "pQ" 
                                 and x_parity[nr][nc] == 1):
                                 x_flip ^= 1
@@ -259,7 +269,7 @@ class ClusterNodeProgram(Program):
             print(f"[{self.node_coords}] Corrections: none")
 
         # ── 6. Logical-Z parity ───────────────────────────────────────────
-        yield from self._send_logical_parity(context, x_parity)
+        yield from self._send_logical_parity(context, z_parity)
         yield from conn.flush()
 
     # ------------------------------------------------------------------ #
@@ -271,6 +281,7 @@ class ClusterNodeProgram(Program):
         r_node, c_node = self.node_coords
         N = self.layout_manager.nodes_per_side
         B = self.layout_manager.block_size
+        subgrid_data = self.layout_manager.get_subgrid_for_node(*self.node_coords)
         round_z = set()
         round_x = set()
         round_tf = set()
@@ -279,15 +290,15 @@ class ClusterNodeProgram(Program):
             if c_node == c:
                 z_set, x_set, tf_set = yield from self._run_border_direction(
                     context, neighbor=f"node_{r_node}_{c_node + 1}",
-                    is_ancilla_side=True, axis="col", local_fixed=B - 1,
-                    round_idx=round_idx,
+                    is_ancilla_side=True, axis="col", local_fixed=self.B_cols - 1,
+                    border_len=self.B_rows, round_idx=round_idx,
                 )
                 round_z ^= z_set; round_x ^= x_set; round_tf ^= tf_set
             elif c_node == c + 1:
                 z_set, x_set, tf_set = yield from self._run_border_direction(
                     context, neighbor=f"node_{r_node}_{c_node - 1}",
                     is_ancilla_side=False, axis="col", local_fixed=0,
-                    round_idx=round_idx,
+                    border_len=self.B_rows, round_idx=round_idx,
                 )
                 round_z ^= z_set; round_x ^= x_set; round_tf ^= tf_set
 
@@ -295,15 +306,15 @@ class ClusterNodeProgram(Program):
             if r_node == r:
                 z_set, x_set, tf_set = yield from self._run_border_direction(
                     context, neighbor=f"node_{r_node + 1}_{c_node}",
-                    is_ancilla_side=True, axis="row", local_fixed=B - 1,
-                    round_idx=round_idx,
+                    is_ancilla_side=True, axis="row", local_fixed=self.B_rows - 1,
+                    border_len=self.B_cols, round_idx=round_idx,
                 )
                 round_z ^= z_set; round_x ^= x_set; round_tf ^= tf_set
             elif r_node == r + 1:
                 z_set, x_set, tf_set = yield from self._run_border_direction(
                     context, neighbor=f"node_{r_node - 1}_{c_node}",
                     is_ancilla_side=False, axis="row", local_fixed=0,
-                    round_idx=round_idx,
+                    border_len=self.B_cols, round_idx=round_idx,
                 )
                 round_z ^= z_set; round_x ^= x_set; round_tf ^= tf_set
 
@@ -311,86 +322,95 @@ class ClusterNodeProgram(Program):
 
     def _run_border_direction(self, context, *, neighbor: str,
                                is_ancilla_side: bool, axis: str,
-                               local_fixed: int, round_idx=None):
+                               local_fixed: int, border_len: int = None,
+                               round_idx=None):
         """
-        Original TeleGate Cat-Ent/Cat-DisEnt protocol.
-        Returns z_applied: set of (r_loc, c_loc) coordinates of local data qubits
-        that received data.Z() an odd number of times.
+        TeleGate Cat-Ent/Cat-DisEnt protocol — per-qubit role detection.
 
-        ANCILLA side (xQ):
-            Cat-Ent A:    CNOT(anc→eA), meas eA in Z, send m_A
-            Cat-DisEnt A: recv m_B, Z^m_B on anc
+        KEY FIX: is_ancilla_side is no longer a global flag for the whole border.
+        Each qubit position is inspected individually to determine whether the
+        LOCAL qubit is an ancilla or a data qubit, regardless of which node is
+        nominally "left" or "right". This is necessary because in the surface
+        code checkerboard layout the ancilla can be on either side of a boundary
+        depending on the stabilizer type and boundary position.
 
-        ANCILLA side (zQ):
-            Cat-Ent A:    recv m_B, X^m_B on eA, CNOT(eA→anc)
-            Cat-DisEnt A: meas eA in X, send m_A
+        For each border position we determine the interaction type:
+          - LOCAL qubit is ancilla (xQ/zQ) AND remote qubit is pQ  → local is ANCILLA side
+          - LOCAL qubit is pQ AND remote qubit is ancilla (xQ/zQ)  → local is DATA side
+          - Any other combination                                   → skip
 
-        DATA side (xQ):
-            Cat-Ent B:    recv m_A, X^m_A on eB, CNOT(eB→data)
-            Cat-DisEnt B: meas eB in X, send m_B
+        Protocol for CNOT(data → ancilla) — X stabilizer (xQ):
+          ANCILLA side:
+            Cat-Ent:    CNOT(anc→eA), meas eA in Z, send m_A
+            Cat-DisEnt: recv m_B, Z^m_B on anc  [tracked in tele_flip]
+          DATA side:
+            Cat-Ent:    recv m_A, X^m_A on eB, CNOT(data→eB), meas eB in X, send m_B
 
-        DATA side (zQ):
-            Cat-Ent B:    CNOT(data→eB), meas eB in Z, send m_B
-            Cat-DisEnt B: recv m_A, Z^m_A on data  ← tracked in z_applied
+        Protocol for CNOT(ancilla → data) — Z stabilizer (zQ):
+          ANCILLA side:
+            Cat-Ent:    recv m_B, X^m_B on eA, CNOT(eA→anc), meas eA in X, send m_A
+          DATA side:
+            Cat-Ent:    CNOT(data→eB), meas eB in Z, send m_B
+            Cat-DisEnt: recv m_A, Z^m_A on data  [tracked in z_applied]
         """
         conn = context.connection
-        B = self.layout_manager.block_size
+        if axis =="col":
+            B = self.B_rows
+        else:
+            B = self.B_cols
+        if border_len is None:
+            border_len = B
         csock = context.csockets[neighbor]
         epr_sock = context.epr_sockets[neighbor]
         z_applied = set()
         x_applied = set()
-        tele_flip = set()   # xQ ancillas that received Z() byproduct → X-basis measurement flipped
+        tele_flip = set()
 
-        for idx in range(B):
-            r_loc, c_loc = (local_fixed, idx) if axis == "col" else (idx, local_fixed)
-            r_glob = self.node_coords[0] * B + r_loc
-            c_glob = self.node_coords[1] * B + c_loc
-            role = self.qubit_roles[r_loc][c_loc]
-            
+        subgrid_data = self.layout_manager.get_subgrid_for_node(*self.node_coords)
+
+        for idx in range(border_len):
+            r_loc, c_loc = (idx, local_fixed) if axis == "col" else (local_fixed, idx)
+            print(f"[{self.node_coords}] Border idx {idx} at local ({r_loc}, {c_loc})")
+            r_glob, c_glob = subgrid_data[r_loc][c_loc]["global_pos"]
+            local_role = self.qubit_roles[r_loc][c_loc]
+
+            # Compute the global position of the remote neighbour across the boundary
             if axis == "col":
-                dc = 1 if local_fixed == B - 1 else -1
+                dc = 1 if local_fixed != 0 else -1
                 nr_glob, nc_glob = r_glob, c_glob + dc
             else:
-                dr = 1 if local_fixed == B - 1 else -1
+                dr = 1 if local_fixed != 0 else -1
                 nr_glob, nc_glob = r_glob + dr, c_glob
-                
+
             remote_role = self.layout_manager.get_qubit_role(nr_glob, nc_glob)
 
-            if is_ancilla_side:
-                anc_role = self.qubit_roles[r_loc][c_loc]
-                """
-                Check if there is a remote adjacent data qubit in this direction.
-                The remote data qubit is on the opposite border of the neighboring node,
-                at the same position along the border (same idx).
-                For axis=col: the remote neighbor is in the horizontal direction,
-                  so the remote data qubit is adjacent only if anc_role=="xQ"
-                  (xQ measures X parity with left/right neighbors).
-                For axis=row: the remote neighbor is in the vertical direction,
-                  so the remote data qubit is adjacent only if anc_role=="zQ"
-                  (zQ measures Z parity with up/down neighbors).
-                If the ancilla has no remote neighbors in the correct direction → skip.
-                """
-                if role in ("xQ", "zQ") and remote_role == "pQ":
-                    role_signal = role
-                else:
-                    role_signal = "skip"
+            # --- Determine per-qubit interaction type ---
+            # LOCAL is ancilla, REMOTE is data → this node handles ancilla side
+            if local_role in ("xQ", "zQ") and remote_role == "pQ":
+                local_is_ancilla = True
+                stab_type = local_role   # "xQ" or "zQ"
+            # LOCAL is data, REMOTE is ancilla → this node handles data side
+            elif local_role == "pQ" and remote_role in ("xQ", "zQ"):
+                local_is_ancilla = False
+                stab_type = remote_role
+            else:
+                # Neither useful pair (pQ-pQ or anc-anc) — both sides skip.
+                # Both nodes independently detect this, so no message exchange needed.
+                continue
 
+            # --- Ancilla side ---
+            if local_is_ancilla:
                 ancilla = self.local_qubits[r_loc][c_loc]
-
-                # eA = epr_sock.create_keep()[0]
-                csock.send(role_signal)
+                csock.send(stab_type)      # tell data side what type this is
                 yield from conn.flush()
-
-                if role_signal == "skip":
-                    #eA.measure()
-                    #yield from conn.flush()
-                    yield from csock.recv()
-                    continue
 
                 eA = epr_sock.create_keep()[0]
                 yield from conn.flush()
 
-                if role_signal == "xQ":
+                if stab_type == "xQ":
+                    # CNOT(data→ancilla): ancilla is TARGET
+                    # Cat-Ent A: CNOT(anc→eA), meas eA in Z, send m_A
+                    # Cat-DisEnt A: recv m_B, Z^m_B on anc
                     self._noise_cnot(ancilla, eA, (r_loc, c_loc), None, round_idx)
                     m_A = eA.measure()
                     yield from conn.flush()
@@ -401,47 +421,43 @@ class ClusterNodeProgram(Program):
                         ancilla.Z()
                         tele_flip.add((r_loc, c_loc))
 
-                else:  # zQ
+                else:  # stab_type == "zQ": CNOT(ancilla→data), ancilla is CONTROL
+                    # Cat-Ent A: recv m_B, X^m_B on eA, CNOT(eA→anc), meas eA in X, send m_A
                     m_B = int((yield from csock.recv()))
                     if m_B == 1:
                         eA.X()
-                    self._noise_cnot(eA, ancilla,None, (r_loc, c_loc), round_idx)
+                    self._noise_cnot(eA, ancilla, None, (r_loc, c_loc), round_idx)
                     eA.H()
                     m_A = eA.measure()
                     yield from conn.flush()
                     csock.send(str(int(m_A)))
                     yield from conn.flush()
 
+            # --- Data side ---
             else:
-                # eB = epr_sock.recv_keep()[0]
-                # yield from conn.flush()
-                signal = yield from csock.recv()
+                signal = yield from csock.recv()   # "xQ" or "zQ" — never "skip" since skip is handled above without messaging
 
-                if signal == "skip" or self.qubit_roles[r_loc][c_loc] != "pQ":
-                    #eB.measure()
-                    #yield from conn.flush()
-                    csock.send("0")
-                    yield from conn.flush()
-                    continue
-                
                 eB = epr_sock.recv_keep()[0]
                 yield from conn.flush()
                 data = self.local_qubits[r_loc][c_loc]
 
                 if signal == "xQ":
+                    # CNOT(data→ancilla): data is CONTROL
+                    # Cat-Ent B: recv m_A, X^m_A on eB, CNOT(data→eB), meas eB in X, send m_B
                     m_A = int((yield from csock.recv()))
                     if m_A == 1:
-                        #x_applied.add((r_loc, c_loc))
                         eB.X()
-                    self._noise_cnot(data, eB, (r_loc, c_loc), None, round_idx)  # X-stab: data→eB
+                    self._noise_cnot(data, eB, (r_loc, c_loc), None, round_idx)
                     eB.H()
                     m_B = eB.measure()
                     yield from conn.flush()
                     csock.send(str(int(m_B)))
                     yield from conn.flush()
 
-                else:  # zQ
-                    self._noise_cnot(eB, data, None, (r_loc, c_loc), round_idx)  # Z-stab: eB→data
+                else:  # signal == "zQ": CNOT(ancilla→data), data is TARGET
+                    # Cat-Ent B: CNOT(data→eB), meas eB in Z, send m_B
+                    # Cat-DisEnt B: recv m_A, Z^m_A on data → tracked in z_applied
+                    self._noise_cnot(data, eB, (r_loc, c_loc), None, round_idx)
                     m_B = eB.measure()
                     yield from conn.flush()
                     csock.send(str(int(m_B)))
@@ -449,7 +465,6 @@ class ClusterNodeProgram(Program):
                     m_A = int((yield from csock.recv()))
                     if m_A == 1:
                         data.Z()
-                        # Track Z gate (XOR: two Z gates cancel out)
                         if (r_loc, c_loc) in z_applied:
                             z_applied.discard((r_loc, c_loc))
                         else:
@@ -484,9 +499,16 @@ class ClusterNodeProgram(Program):
         zq_pos = []     # positions of zQ ancillas (detect X errors)
         xq_pos = []     # positions of xQ ancillas (detect Z errors)
 
-        for r in range(B):
-            for c in range(B):
-                gr, gc = r_node * B + r, c_node * B + c # global position of this qubit
+        # FIX: use actual subgrid dimensions so border nodes include all their qubits.
+        # The global position of qubit (r,c) in this node is derived from subgrid_data
+        # to avoid the r_node*B offset being wrong for non-square partitions.
+        subgrid_data = self.layout_manager.get_subgrid_for_node(*self.node_coords)
+        actual_rows = len(subgrid_data)
+        actual_cols = len(subgrid_data[0]) if subgrid_data else B
+
+        for r in range(actual_rows):
+            for c in range(actual_cols):
+                gr, gc = subgrid_data[r][c]["global_pos"]  # use stored global position
                 role   = self.qubit_roles[r][c]
                 if role == "pQ":
                     d_pos.append((gr, gc))
@@ -504,11 +526,29 @@ class ClusterNodeProgram(Program):
                 for j, (dr, dc) in enumerate(d_pos):
                     if abs(ar - dr) + abs(ac - dc) == 1:
                         H_block[i, j] = 1                   # This ancilla is connected to this data qubit → 1 in H
+            # FIX: syndrome dict keys are local (r_local, c_local), not global.
+            # Convert each ancilla global position back to local using the actual subgrid.
+            def _global_to_local(gr, gc):
+                for ri in range(actual_rows):
+                    for ci in range(actual_cols):
+                        if subgrid_data[ri][ci]["global_pos"] == (gr, gc):
+                            return (ri, ci)
+                return None
+
             s_block = np.array(
-                [self.ancilla_measurements.get((p[0] % B, p[1] % B), 0)     # Syndrome value for this ancilla, default to 0 if not measured (e.g. if no ancilla in this position) or if position not found due to some error. The coordinator will handle any inconsistencies.
+                [self.ancilla_measurements.get(_global_to_local(p[0], p[1]), 0)
                  for p in anc_pos],
                 dtype=int,
             )
+
+            # FIX: remove rows with all zeros (border ancillas whose neighbors
+            # are entirely on another node's subgrid). These rows have no
+            # data-qubit column to assign an error to, so they only add
+            # inconsistent constraints to the OSD solver.
+            nonzero_rows = H_block.sum(axis=1) > 0
+            H_block = H_block[nonzero_rows]
+            s_block = s_block[nonzero_rows]
+
             return H_block, s_block
 
         H_Z, s_Z = _make_H_and_s(zq_pos)   # Z stabilizers → X error detection
@@ -533,18 +573,34 @@ class ClusterNodeProgram(Program):
             if total_energy > 1e-10:
                 cumulative = np.cumsum(sigma ** 2)
                 k = min(int(np.searchsorted(cumulative, energy_threshold * total_energy) + 1), n)
+            print(f"k:{k} / {n} captures {cumulative[k-1] / total_energy:.2%} energy for {error_type}-type errors at node {self.node_coords}")
+
+            # Select k most informative columns of H via SVD-guided greedy ranking.
+            # Vt rows are right-singular vectors; the column of H with highest weight
+            # in each leading mode captures the most variance. We pick one unique column
+            # per mode, preserving the GF(2) structure of H for the OSD solver.
             selected_cols = []
             for i in range(k):
                 for j in np.argsort(-np.abs(Vt[i])):
                     if j not in selected_cols:
-                        selected_cols.append(j); break
+                        selected_cols.append(int(j))
+                        break
             for j in range(n):
-                if len(selected_cols) >= k: break
-                if j not in selected_cols: selected_cols.append(j)
-            H_reduced = H[:, selected_cols].astype(int)
+                if len(selected_cols) >= k:
+                    break
+                if j not in selected_cols:
+                    selected_cols.append(j)
+
+            H_reduced = H[:, selected_cols].astype(int)   # (m, k) GF(2) submatrix
+
+            # V_k: sparse (n, k) back-projection matrix.
+            # V_k[selected_cols[i], i] = 1 so that the coordinator's
+            # round(|V_k @ e_block|) % 2 correctly maps each reduced-space bit
+            # back to its original data-qubit position.
             V_k = np.zeros((n, k), dtype=float)
             for i, col in enumerate(selected_cols):
                 V_k[col, i] = 1.0
+
             r_node, c_node = self.node_coords
             B = self.layout_manager.block_size
             return {
@@ -570,10 +626,16 @@ class ClusterNodeProgram(Program):
     def _apply_corrections(self, corrections: list, gate: str = "X"):
         r_node, c_node = self.node_coords
         B = self.layout_manager.block_size
-        r_start, c_start = r_node * B, c_node * B
+        # FIX: use actual global start position from subgrid instead of r_node*B.
+        # For grids where global_size % nodes_per_side != 0, r_node*B gives the wrong offset.
+        subgrid_data = self.layout_manager.get_subgrid_for_node(*self.node_coords)
+        r_start = subgrid_data[0][0]["global_pos"][0]
+        c_start = subgrid_data[0][0]["global_pos"][1]
+        self.B_rows = len(subgrid_data)
+        self.B_cols = len(subgrid_data[0]) if subgrid_data else B
         for r_global, c_global in corrections:
-            if (r_start <= r_global < r_start + B
-                    and c_start <= c_global < c_start + B):
+            if (r_start <= r_global < r_start + self.B_rows
+                    and c_start <= c_global < c_start + self.B_cols):
                 r_local = r_global - r_start
                 c_local = c_global - c_start
                 if self.qubit_roles[r_local][c_local] == "pQ":
@@ -594,28 +656,34 @@ class ClusterNodeProgram(Program):
         Z̄ = tensor product of Z on all data qubits along the leftmost column
         of the global grid (local column 0 of nodes with c_node == 0).
 
-        With correct CNOT directions (CNOT(data→ancilla) for xQ stabilizers),
-        data qubits are never disturbed by stabilizer measurements. After
-        corrections they should be back in |0⟩ (parity 0) if decoding
-        succeeded, or flipped (parity 1) if a logical error remains.
-
-        x_parity is accepted for API compatibility but ignored: the physical
-        measurement already captures all byproduct X gates on the data qubits.
+        The zQ TeleGate applies Z byproducts to data qubits on the border.
+        These are tracked in x_parity (passed as z_parity from the caller).
+        We XOR the measured parity with the accumulated Z byproducts on each
+        data qubit in the logical column to get the true logical parity.
         """
         csock = context.csockets[self.coordinator_name]
         r_node, c_node = self.node_coords
         B = self.layout_manager.block_size
+        # FIX: use actual subgrid row count so border nodes don't miss qubits
+        subgrid_data = self.layout_manager.get_subgrid_for_node(*self.node_coords)
+        actual_rows = len(subgrid_data)
 
         if c_node != 0:
             csock.send(json.dumps(-1))
         else:
             parity = 0
-            for r in range(B):
+            for r in range(actual_rows):
                 if self.qubit_roles[r][0] != "pQ":
                     continue
                 outcome = self.local_qubits[r][0].measure()
                 yield from context.connection.flush()
-                parity ^= int(outcome)
+                measured = int(outcome)
+                # Compensate Z byproducts from TeleGate that were applied to this
+                # data qubit and tracked in z_parity (passed as x_parity parameter).
+                # A Z gate on a qubit in |0⟩/|1⟩ basis flips the measurement result.
+                #if x_parity is not None and x_parity[r][0] == 1:
+                #    measured ^= 1
+                parity ^= measured
 
             print(f"[{self.node_coords}] Logical-Z physical parity = {parity}")
             csock.send(json.dumps(parity))
@@ -648,7 +716,10 @@ class ClusterNodeProgram(Program):
             csock.send(json.dumps(-1))
         else:
             parity = 0
-            for c in range(B):
+            # FIX: use actual subgrid column count so border nodes don't miss qubits
+            subgrid_data = self.layout_manager.get_subgrid_for_node(*self.node_coords)
+            actual_cols = len(subgrid_data[0]) if subgrid_data else B
+            for c in range(actual_cols):
                 if self.qubit_roles[0][c] != "pQ":
                     continue
                 # Measure in X basis: H then measure in Z
