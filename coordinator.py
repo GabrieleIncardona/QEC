@@ -171,8 +171,6 @@ class CoordinatorProgram(Program):
     
     # Step 5 — Send corrections to nodes
     def _send_corrections(self, context: ProgramContext, payloads: list, corrections_per_node: dict):
-        # FIX: iterate over ALL nodes, not just the active payloads.
-        # Inactive nodes still call recv() and would deadlock if skipped.
         for name in self.node_names:
             parts = name.replace("node_", "").split("_")
             node_id = (int(parts[0]), int(parts[1]))

@@ -167,12 +167,10 @@ class ClusterNodeProgram(Program):
                                 # X stabilizer: data is control, ancilla is target.
                                 # CNOT(data→ancilla): ancilla in |+⟩ accumulates X parity of neighbors.
                                 # Data qubit is the control → not disturbed.
-                                # FIX: data is control, ancilla is target for X stabilizer
                                 self._noise_cnot(data, ancilla, (nr, nc), (r, c), round_idx)
                             else:
                                 # Z stabilizer: ancilla is control, data is target.
                                 # CNOT(ancilla->data): measures Z parity correctly.
-                                # FIX: ancilla is control, data is target for Z stabilizer
                                 self._noise_cnot(ancilla, data, (r, c), (nr, nc), round_idx)
             yield from conn.flush()
 
@@ -326,13 +324,6 @@ class ClusterNodeProgram(Program):
                                round_idx=None):
         """
         TeleGate Cat-Ent/Cat-DisEnt protocol — per-qubit role detection.
-
-        KEY FIX: is_ancilla_side is no longer a global flag for the whole border.
-        Each qubit position is inspected individually to determine whether the
-        LOCAL qubit is an ancilla or a data qubit, regardless of which node is
-        nominally "left" or "right". This is necessary because in the surface
-        code checkerboard layout the ancilla can be on either side of a boundary
-        depending on the stabilizer type and boundary position.
 
         For each border position we determine the interaction type:
           - LOCAL qubit is ancilla (xQ/zQ) AND remote qubit is pQ  → local is ANCILLA side
@@ -499,7 +490,6 @@ class ClusterNodeProgram(Program):
         zq_pos = []     # positions of zQ ancillas (detect X errors)
         xq_pos = []     # positions of xQ ancillas (detect Z errors)
 
-        # FIX: use actual subgrid dimensions so border nodes include all their qubits.
         # The global position of qubit (r,c) in this node is derived from subgrid_data
         # to avoid the r_node*B offset being wrong for non-square partitions.
         subgrid_data = self.layout_manager.get_subgrid_for_node(*self.node_coords)
@@ -526,7 +516,6 @@ class ClusterNodeProgram(Program):
                 for j, (dr, dc) in enumerate(d_pos):
                     if abs(ar - dr) + abs(ac - dc) == 1:
                         H_block[i, j] = 1                   # This ancilla is connected to this data qubit → 1 in H
-            # FIX: syndrome dict keys are local (r_local, c_local), not global.
             # Convert each ancilla global position back to local using the actual subgrid.
             def _global_to_local(gr, gc):
                 for ri in range(actual_rows):
@@ -540,8 +529,7 @@ class ClusterNodeProgram(Program):
                  for p in anc_pos],
                 dtype=int,
             )
-
-            # FIX: remove rows with all zeros (border ancillas whose neighbors
+            # Remove rows with zero syndrome (inactive stabilizers that don't detect any errors in this round and
             # are entirely on another node's subgrid). These rows have no
             # data-qubit column to assign an error to, so they only add
             # inconsistent constraints to the OSD solver.
@@ -626,8 +614,7 @@ class ClusterNodeProgram(Program):
     def _apply_corrections(self, corrections: list, gate: str = "X"):
         r_node, c_node = self.node_coords
         B = self.layout_manager.block_size
-        # FIX: use actual global start position from subgrid instead of r_node*B.
-        # For grids where global_size % nodes_per_side != 0, r_node*B gives the wrong offset.
+
         subgrid_data = self.layout_manager.get_subgrid_for_node(*self.node_coords)
         r_start = subgrid_data[0][0]["global_pos"][0]
         c_start = subgrid_data[0][0]["global_pos"][1]
@@ -664,7 +651,6 @@ class ClusterNodeProgram(Program):
         csock = context.csockets[self.coordinator_name]
         r_node, c_node = self.node_coords
         B = self.layout_manager.block_size
-        # FIX: use actual subgrid row count so border nodes don't miss qubits
         subgrid_data = self.layout_manager.get_subgrid_for_node(*self.node_coords)
         actual_rows = len(subgrid_data)
 
@@ -716,7 +702,6 @@ class ClusterNodeProgram(Program):
             csock.send(json.dumps(-1))
         else:
             parity = 0
-            # FIX: use actual subgrid column count so border nodes don't miss qubits
             subgrid_data = self.layout_manager.get_subgrid_for_node(*self.node_coords)
             actual_cols = len(subgrid_data[0]) if subgrid_data else B
             for c in range(actual_cols):
