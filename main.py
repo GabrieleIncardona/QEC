@@ -15,7 +15,7 @@ from dis_surface_mesure import ClusterNodeProgram
 n.set_qstate_formalism(n.QFormalism.STAB)
 
 def main(error, prob):
-    global_size    = 5   # planar surface code with 10x10 qubits (100 qubits total)
+    global_size    = 13   # planar surface code with 10x10 qubits (100 qubits total)
     nodes_per_side = 2   # 3x3 grid of nodes, each node manages a 3x3 subgrid
 
     # Step 1: Create the Surface Layout Manager
@@ -31,12 +31,15 @@ def main(error, prob):
     all_node_names   = cluster_node_names + [coordinator_name]
 
     # Step 3: Configure the network (complete graph: every node can reach every other)
+    max_qubits_per_node = 200
     cfg = create_complete_graph_network(
         node_names=all_node_names,
         link_typ="perfect",
         link_cfg=PerfectQLinkConfig(state_delay=100),
         clink_typ="default",
         clink_cfg=DefaultCLinkConfig(delay=500),
+        qdevice_typ="generic",
+        qdevice_cfg={"num_qubits": max_qubits_per_node}
     )
 
     # Step 4: Create programs for each cluster node and coordinator
@@ -68,10 +71,13 @@ def main(error, prob):
         results = run_simulation(config=cfg, programs=programs, num_times=num_runs)
 
         parities = []
+        total_cnots = 0
         for node_results in results:
             for res in node_results:
-                if isinstance(res, int):  # Logical parity results are integers (0 or 1) only sent by the coordinator
-                    parities.append(res)
+                if isinstance(res, tuple) and len(res) == 2:  # (parity, cnot_count) from coordinator
+                    parity, cnot_count = res
+                    parities.append(parity)
+                    total_cnots += cnot_count
                     
         # Calculate statistics
         failures = sum(parities)                # Every 1 is a failure
@@ -82,6 +88,8 @@ def main(error, prob):
         print(f"Failures (Logical Error) : {failures}")
         print(f" Successes: {successes}")
         print(f"Accuracy: {accuracy:.2f}%")
+        print(f"Total CNOT gates (all nodes, all runs): {total_cnots}")
+        print(f"Average CNOT gates per run: {total_cnots / num_runs:.1f}")
 
     except Exception as e:
         print(f"\nError: {e}")

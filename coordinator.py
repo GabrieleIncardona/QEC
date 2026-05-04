@@ -58,8 +58,19 @@ class CoordinatorProgram(Program):
         status = "OK — no logical error" if global_parity == 0 else "FAIL — logical error survived!"
         print(f"\n=== Logical Z (global) = {global_parity} → {status} ===\n")
 
+        #yield from context.connection.flush()
+        #return global_parity
+
+        # Step 7: aggregate CNOT counts from all nodes
+        global_cnot_count = 0
+        for name in self.node_names:
+            msg = yield from context.csockets[name].recv()
+            global_cnot_count += json.loads(msg)
+ 
+        print(f"=== Global CNOT count = {global_cnot_count} ===\n")
+ 
         yield from context.connection.flush()
-        return global_parity
+        return global_parity, global_cnot_count
 
     # Step 2 — Assemble block-diagonal global system
     def _assemble_global_system(self, payloads: list) -> tuple:
