@@ -78,20 +78,6 @@ class ClusterNodeProgram(Program):
             self.qubit_roles.append(row_r)
 
         # ── 3. Two rounds of stabilizer measurements ──────────────────────
-        # The gate data.Z() is applied to data qubits on the border during
-        # Cat-DisEnt zQ.
-        #
-        # Spacetime decoding with classical feedback compensation:
-        #   Between round 1 and round 2, Z gates accumulated on data qubits
-        #   change the measurement of adjacent xQ ancillas in round 2.
-        #   We maintain a classical register `z_parity[r][c]` that counts (mod 2)
-        #   how many Z gates each data qubit has received so far.
-        #   Before each xQ measurement in round 2, if the neighboring data qubit
-        #   has odd z_parity, we flip the corresponding xQ syndrome.
-        #
-        # z_parity[r][c]: Parity of Z gates accumulated on data qubit (r,c)
-        #   0 = even number of Z gates (no net effect)
-        #   1 = odd number of Z gates (equivalent to active Z gate)
 
         z_parity = [[0] * self.B_cols for _ in range(self.B_rows)]  # Classical register tracking Z gates
         x_parity = [[0] * self.B_cols for _ in range(self.B_rows)]  # Classical register tracking X gates
@@ -117,10 +103,12 @@ class ClusterNodeProgram(Program):
                             for r in range(self.B_rows):
                                 for c in range(self.B_cols):
                                     if self.qubit_roles[r][c]== "pQ":
-                                        # simulation a hadamard error
-                                        self._noisy_H(self.local_qubits[r][c], r, c)
-                                        # applay 2 time hadamard, in this way, HIH = I, but we applay error
-                                        self._noisy_H(self.local_qubits[r][c], r, c)
+                                                    # simulate a Hadamard error
+                                                    self._noisy_H(self.local_qubits[r][c], r, c)
+                                                    # apply Hadamard again; doing two noisy H applications
+                                                    # approximates an imperfect H gate while keeping
+                                                    # the ideal H^2 = I behaviour
+                                                    self._noisy_H(self.local_qubits[r][c], r, c)
 
                         case "initialization":
                             print(f"[{self.node_coords}] initialization error: simulating by flipping all ancilla measurements in round 2.")
@@ -144,7 +132,7 @@ class ClusterNodeProgram(Program):
                         
                         # Add error on ancilla initialization if the user selected it and the error occurs:
                         if (self.error == "initialization" or self.error == "all") and random.random() < self.NOISE_PROBABILITY and round_idx == 1:
-                            # For simplicity, we model ancilla initialization error as an X error for zQ ancillas and a Z error for xQ ancillas. This means the ancilla starts in the wrong state (|1⟩ instead of |0⟩ for zQ, or |−⟩ instead of |+⟩ for xQ), which will flip the measurement outcome and simulate a inizialization error.
+                            # For simplicity, we model ancilla initialization error as an X error for zQ ancillas and a Z error for xQ ancillas. This means the ancilla starts in the wrong state (|1⟩ instead of |0⟩ for zQ, or |−⟩ instead of |+⟩ for xQ), which will flip the measurement outcome and simulate an initialization error.
                             if role == "zQ":
                                 ancilla.X()
                                 print(f"[{self.node_coords}] Noise: X error on zQ ancilla at ({r}, {c})")
@@ -209,13 +197,13 @@ class ClusterNodeProgram(Program):
 
                     yield from conn.flush()
 
-                    # 2. Applay readout error if the user selected it and the error occurs:
+                    # 2. Apply readout error if the user selected it and the error occurs:
                     if (self.error == "readout" or self.error == "all") and random.random() < self.NOISE_PROBABILITY and round_idx == 1:
                         m = 1 - m  # flip the measurement result
                         print(f"[{self.node_coords}] Error flip at: ({r}, {c})")
                     raw = int(m)
 
-                    # Z compensation for xQ: Z anticommutes with X
+                    # Z compensation for xQ: Z anticommutes with X.
                     # Each neighboring data qubit with odd z_parity contributes
                     # a flip to the xQ measurement (because Z|ψ⟩ in X basis → flip).
                     if role == "xQ":
@@ -471,7 +459,51 @@ class ClusterNodeProgram(Program):
                             z_applied.add((r_loc, c_loc))
 
         return z_applied, x_applied, tele_flip
+    
+    def _bp_local(self, H: np.ndarray, s: np.ndarray, max_iter: int = 20) -> np.ndarray:
+        """
+        Belief Propagation over GF(2) — Min-Sum decoder.
+        """
+        m, n = H.shape
+        p = self.NOISE_PROBABILITY
+        ch_llr = np.full(n, np.log((1 - p) / p))
 
+        msg_v2c = np.zeros((m, n))
+        msg_c2v = np.zeros((m, n))
+
+        for _ in range(max_iter):
+            # Check-node update — Min-Sum
+            for i in range(m):
+                neighbors = np.where(H[i] == 1)[0]
+                for j in neighbors:
+                    others = [k for k in neighbors if k != j]
+                    if not others:
+                        msg_c2v[i, j] = 0.0
+                        continue
+                    # Sign: product of the signs of incoming messages
+                    sign = 1
+                    for k in others:
+                        sign *= np.sign(msg_v2c[i, k]) if msg_v2c[i, k] != 0 else 1
+                    # Magnitude: minimum of absolute values
+                    magnitude = min(abs(msg_v2c[i, k]) for k in others)
+                    msg_c2v[i, j] = sign * magnitude
+
+            # Variable-node update — invariato
+            for j in range(n):
+                neighbors = np.where(H[:, j] == 1)[0]
+                total = ch_llr[j] + sum(msg_c2v[i, j] for i in neighbors)
+                for i in neighbors:
+                    msg_v2c[i, j] = total - msg_c2v[i, j]
+
+            # Hard decision
+            llr_total = ch_llr + msg_c2v.sum(axis=0)
+            e_hat = (llr_total < 0).astype(int)
+
+            # Check convergence
+            if np.all((H @ e_hat) % 2 == s):
+                return e_hat
+
+        return e_hat
     # ------------------------------------------------------------------ #
     #  SVD payload                                                         #
     # ------------------------------------------------------------------ #
@@ -563,6 +595,21 @@ class ClusterNodeProgram(Program):
                 return {"active": False, "node_id": list(self.node_coords),
                         "error_type": error_type,
                         "data_positions": [list(p) for p in data_pos]}
+            e_bp = self._bp_local(H, s, max_iter=20)
+            s_residual = (s + H @ e_bp) % 2
+
+            if not np.any(s_residual):
+                # BP solved everything: send the corrections to the coordinator
+                # which will back-project them as usual
+                bp_corrections = [list(data_pos[j]) for j in range(len(e_bp)) if e_bp[j] == 1]
+                return {
+                    "active": False,
+                    "node_id": list(self.node_coords),
+                    "error_type": error_type,
+                    "data_positions": [list(p) for p in data_pos],
+                    "bp_corrections": bp_corrections,   # ← corrections to apply
+                }
+
             m, n = H.shape
             U, sigma, Vt = np.linalg.svd(H.astype(float), full_matrices=False)
             max_k = Vt.shape[0]
@@ -571,7 +618,7 @@ class ClusterNodeProgram(Program):
             if total_energy > 1e-10:
                 cumulative = np.cumsum(sigma ** 2)
                 k = min(int(np.searchsorted(cumulative, energy_threshold * total_energy) + 1), max_k)
-            print(f"k:{k} / {n} captures {cumulative[k-1] / total_energy:.2%} energy for {error_type}-type errors at node {self.node_coords}")
+            print(f"k: {k} / {n} captures {cumulative[k-1] / total_energy:.2%} energy for {error_type}-type errors at node {self.node_coords}")
 
             # Select k most informative columns of H via SVD-guided greedy ranking.
             # Vt rows are right-singular vectors; the column of H with highest weight
@@ -605,7 +652,7 @@ class ClusterNodeProgram(Program):
                 "active": True, "node_id": list(self.node_coords),
                 "error_type": error_type,
                 "H_reduced": H_reduced.tolist(), "V_k": V_k.tolist(),
-                "s": s.tolist(), "k": k,
+                "s": s_residual.tolist(), "k": k,
                 "data_positions": [list(p) for p in data_pos],
                 "global_offset": [r_node * B, c_node * B],
             }

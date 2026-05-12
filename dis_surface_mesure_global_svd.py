@@ -1,15 +1,21 @@
 """
-Cluster Node Program — No-SVD variant
-Each node sends the full (un-compressed) parity-check matrix H and
-syndrome vector s to the coordinator.  The coordinator is responsible
-for the SVD dimensionality reduction before running OSD.
+Cluster Node Program — No-SVD variant with local BP (Min-Sum) pre-filter
+Each node applies Min-Sum Belief Propagation locally before sending data
+to the coordinator.
 
-Differences from dis_surface_mesure.py
----------------------------------------
-* _build_svd_payloads  →  _build_full_payloads
-  Skips every SVD step; sends H_Z / H_X as-is together with s and
-  the data-qubit positions.  The "active" flag logic is kept unchanged.
-* _communicate_with_coordinator is unchanged (same message protocol).
+If BP converges (syndrome zeroed), the node sends active=False with
+bp_corrections so the coordinator can route them back.
+If BP does not converge, the node sends the full H and residual syndrome
+(s_residual = s XOR H @ e_bp) so the coordinator's SVD+OSD works on a
+partially-cleaned syndrome.
+
+Differences from dis_surface_mesure_global_svd.py (original)
+--------------------------------------------------------------
+* Added _bp_local()  — Min-Sum BP decoder (more robust on short cycles).
+* _build_full_payloads now runs BP before building the payload:
+    - BP converges  → active=False, bp_corrections filled
+    - BP partial    → active=True,  s = s_residual, H_full unchanged
+* Removed debug print statements (DEBUG: starting rounds loop / round_idx).
 * Everything else (noise, TeleGate, logical-parity) is identical.
 """
 
@@ -22,36 +28,40 @@ from netqasm.sdk.qubit import Qubit
 
 
 class ClusterNodeProgram(Program):
-    ENERGY_THRESHOLD  = 0.98       # kept for API compatibility; used only by coordinator
-    NUM_ROUNDS        = 2
+    ENERGY_THRESHOLD = 0.98
+    NUM_ROUNDS       = 2
+    # Min-Sum scaling factor (0.75 corrects the magnitude under-estimation
+    # of plain Min-Sum while keeping cycle-robustness)
+    BP_ALPHA         = 0.75
+    BP_MAX_ITER      = 20
 
     def __init__(self, node_coords: tuple, layout_manager, error, prob,
                  coordinator_name: str = "coordinator"):
-        self.node_coords = node_coords
-        self.layout_manager = layout_manager
+        self.node_coords      = node_coords
+        self.layout_manager   = layout_manager
         self.coordinator_name = coordinator_name
-        self.error = error
+        self.error            = error
         self.NOISE_PROBABILITY = prob
 
         r, c = node_coords
         N = layout_manager.nodes_per_side
         self.neighbors = []
-        if r > 0: self.neighbors.append(f"node_{r-1}_{c}")
+        if r > 0:     self.neighbors.append(f"node_{r-1}_{c}")
         if r < N - 1: self.neighbors.append(f"node_{r+1}_{c}")
-        if c > 0: self.neighbors.append(f"node_{r}_{c-1}")
+        if c > 0:     self.neighbors.append(f"node_{r}_{c-1}")
         if c < N - 1: self.neighbors.append(f"node_{r}_{c+1}")
 
     @property
     def meta(self) -> ProgramMeta:
         B = self.layout_manager.block_size
-        subgrid_data = self.layout_manager.get_subgrid_for_node(*self.node_coords)
-        actual_rows = len(subgrid_data)
-        actual_cols = len(subgrid_data[0]) if subgrid_data else B
+        subgrid_data  = self.layout_manager.get_subgrid_for_node(*self.node_coords)
+        actual_rows   = len(subgrid_data)
+        actual_cols   = len(subgrid_data[0]) if subgrid_data else B
         actual_qubits = actual_rows * actual_cols
-        border_eprs = max(actual_rows, actual_cols) if self.neighbors else 0
+        border_eprs   = max(actual_rows, actual_cols) if self.neighbors else 0
         return ProgramMeta(
-            name = f"node_{self.node_coords[0]}_{self.node_coords[1]}",
-            csockets = self.neighbors + [self.coordinator_name],
+            name        = f"node_{self.node_coords[0]}_{self.node_coords[1]}",
+            csockets    = self.neighbors + [self.coordinator_name],
             epr_sockets = self.neighbors,
             max_qubits  = actual_qubits + border_eprs,
         )
@@ -60,15 +70,16 @@ class ClusterNodeProgram(Program):
     #  Run                                                                 #
     # ------------------------------------------------------------------ #
     def run(self, context: ProgramContext):
-        conn = context.connection
+        conn         = context.connection
         subgrid_data = self.layout_manager.get_subgrid_for_node(*self.node_coords)
-        self.B_rows = len(subgrid_data)
-        self.B_cols = len(subgrid_data[0]) if subgrid_data else self.layout_manager.block_size
+        self.B_rows  = len(subgrid_data)
+        self.B_cols  = len(subgrid_data[0]) if subgrid_data else self.layout_manager.block_size
 
-        self.injected_X_errors = set()
-        self.injected_Z_errors = set()
+        self.injected_X_errors    = set()
+        self.injected_Z_errors    = set()
         self.applied_X_corrections = set()
         self.applied_Z_corrections = set()
+
         self.errors = set()
         if self.error == "all":
             self.errors = {"identity", "hadamard", "initialization", "readout", "cnot"}
@@ -85,14 +96,12 @@ class ClusterNodeProgram(Program):
             self.local_qubits.append(row_q)
             self.qubit_roles.append(row_r)
 
-        z_parity = [[0] * self.B_cols for _ in range(self.B_rows)]
-        x_parity = [[0] * self.B_cols for _ in range(self.B_rows)]
-        tele_flip = {}
+        z_parity          = [[0] * self.B_cols for _ in range(self.B_rows)]
+        x_parity          = [[0] * self.B_cols for _ in range(self.B_rows)]
+        tele_flip         = {}
         all_round_syndromes = []
 
-        print(f"[{self.node_coords}] DEBUG: starting rounds loop")
         for round_idx in range(self.NUM_ROUNDS):
-            print(f"[{self.node_coords}] DEBUG: round_idx={round_idx} start")
             if round_idx == 1:
                 # 2. Apply noise
                 for error in self.errors:
@@ -161,7 +170,9 @@ class ClusterNodeProgram(Program):
             yield from conn.flush()
 
             # c) TeleGate border protocol
-            round_z, round_x, round_tf = yield from self._teleported_cnot_borders(context, round_idx=round_idx)
+            round_z, round_x, round_tf = yield from self._teleported_cnot_borders(
+                context, round_idx=round_idx
+            )
 
             # d) Update parity registers
             for (r, c) in round_z:
@@ -210,29 +221,34 @@ class ClusterNodeProgram(Program):
                         round_syndrome[(r, c)] = raw ^ x_flip
 
             all_round_syndromes.append(round_syndrome)
-            active = {k: v for k, v in round_syndrome.items() if v == 1}
+            active_synd = {k: v for k, v in round_syndrome.items() if v == 1}
             print(f"[{self.node_coords}] Round {round_idx + 1} syndrome: "
-                  f"{active if active else 'clean'}")
+                  f"{active_synd if active_synd else 'clean'}")
 
         # 4. Spacetime decoding: XOR between the two rounds
-        s1 = all_round_syndromes[0]
-        s2 = all_round_syndromes[1]
+        s1      = all_round_syndromes[0]
+        s2      = all_round_syndromes[1]
         all_pos = set(s1.keys()) | set(s2.keys())
-        self.ancilla_measurements = {pos: s1.get(pos, 0) ^ s2.get(pos, 0) for pos in all_pos}
+        self.ancilla_measurements = {
+            pos: s1.get(pos, 0) ^ s2.get(pos, 0) for pos in all_pos
+        }
 
         active_final = {k: v for k, v in self.ancilla_measurements.items() if v == 1}
         print(f"[{self.node_coords}] Spacetime syndrome (XOR): "
               f"{active_final if active_final else 'clean'}")
 
-        # 5. Build FULL payloads (no SVD here) and exchange with coordinator
+        # 5. Build payloads with local BP pre-filter and exchange with coordinator
         payload_X, payload_Z = self._build_full_payloads()
-        corr_X, corr_Z = yield from self._communicate_with_coordinator(context, payload_X, payload_Z)
+        corr_X, corr_Z = yield from self._communicate_with_coordinator(
+            context, payload_X, payload_Z
+        )
         self._apply_corrections(corr_X, gate="X")
         self._apply_corrections(corr_Z, gate="Z")
         yield from conn.flush()
 
         if self.applied_X_corrections and self.applied_Z_corrections:
-            print(f"[{self.node_coords}] Corrections X: {sorted(self.applied_X_corrections)} Corrections Z: {sorted(self.applied_Z_corrections)}")
+            print(f"[{self.node_coords}] Corrections X: {sorted(self.applied_X_corrections)} "
+                  f"Corrections Z: {sorted(self.applied_Z_corrections)}")
         elif self.applied_Z_corrections:
             print(f"[{self.node_coords}] Corrections Z: {sorted(self.applied_Z_corrections)}")
         elif self.applied_X_corrections:
@@ -245,15 +261,13 @@ class ClusterNodeProgram(Program):
         yield from conn.flush()
 
     # ------------------------------------------------------------------ #
-    #  TeleGate border protocol  (unchanged from original)                 #
+    #  TeleGate border protocol                                           #
     # ------------------------------------------------------------------ #
     def _teleported_cnot_borders(self, context, round_idx=None):
         if self.neighbors == []:
-            return set(), set(), set()  # No neighbors → no TeleGate interactions → no Z or X gates applied, no teleported flips
+            return set(), set(), set()
         r_node, c_node = self.node_coords
         N = self.layout_manager.nodes_per_side
-        B = self.layout_manager.block_size
-        subgrid_data = self.layout_manager.get_subgrid_for_node(*self.node_coords)
         round_z = set()
         round_x = set()
         round_tf = set()
@@ -296,36 +310,11 @@ class ClusterNodeProgram(Program):
                                is_ancilla_side: bool, axis: str,
                                local_fixed: int, border_len: int = None,
                                round_idx=None):
-        """
-        TeleGate Cat-Ent/Cat-DisEnt protocol — per-qubit role detection.
-
-        For each border position we determine the interaction type:
-          - LOCAL qubit is ancilla (xQ/zQ) AND remote qubit is pQ  → local is ANCILLA side
-          - LOCAL qubit is pQ AND remote qubit is ancilla (xQ/zQ)  → local is DATA side
-          - Any other combination                                   → skip
-
-        Protocol for CNOT(data → ancilla) — X stabilizer (xQ):
-          ANCILLA side:
-            Cat-Ent:    CNOT(anc→eA), meas eA in Z, send m_A
-            Cat-DisEnt: recv m_B, Z^m_B on anc  [tracked in tele_flip]
-          DATA side:
-            Cat-Ent:    recv m_A, X^m_A on eB, CNOT(data→eB), meas eB in X, send m_B
-
-        Protocol for CNOT(ancilla → data) — Z stabilizer (zQ):
-          ANCILLA side:
-            Cat-Ent:    recv m_B, X^m_B on eA, CNOT(eA→anc), meas eA in X, send m_A
-          DATA side:
-            Cat-Ent:    CNOT(data→eB), meas eB in Z, send m_B
-            Cat-DisEnt: recv m_A, Z^m_A on data  [tracked in z_applied]
-        """
-        conn = context.connection
-        if axis =="col":
-            B = self.B_rows
-        else:
-            B = self.B_cols
+        conn      = context.connection
+        B         = self.B_rows if axis == "col" else self.B_cols
         if border_len is None:
             border_len = B
-        csock = context.csockets[neighbor]
+        csock    = context.csockets[neighbor]
         epr_sock = context.epr_sockets[neighbor]
         z_applied = set()
         x_applied = set()
@@ -335,11 +324,9 @@ class ClusterNodeProgram(Program):
 
         for idx in range(border_len):
             r_loc, c_loc = (idx, local_fixed) if axis == "col" else (local_fixed, idx)
-            # print(f"[{self.node_coords}] Border idx {idx} at local ({r_loc}, {c_loc})")
             r_glob, c_glob = subgrid_data[r_loc][c_loc]["global_pos"]
-            local_role = self.qubit_roles[r_loc][c_loc]
+            local_role     = self.qubit_roles[r_loc][c_loc]
 
-            # Compute the global position of the remote neighbour across the boundary
             if axis == "col":
                 dc = 1 if local_fixed != 0 else -1
                 nr_glob, nc_glob = r_glob, c_glob + dc
@@ -349,33 +336,23 @@ class ClusterNodeProgram(Program):
 
             remote_role = self.layout_manager.get_qubit_role(nr_glob, nc_glob)
 
-            # --- Determine per-qubit interaction type ---
-            # LOCAL is ancilla, REMOTE is data → this node handles ancilla side
             if local_role in ("xQ", "zQ") and remote_role == "pQ":
                 local_is_ancilla = True
-                stab_type = local_role   # "xQ" or "zQ"
-            # LOCAL is data, REMOTE is ancilla → this node handles data side
+                stab_type = local_role
             elif local_role == "pQ" and remote_role in ("xQ", "zQ"):
                 local_is_ancilla = False
                 stab_type = remote_role
             else:
-                # Neither useful pair (pQ-pQ or anc-anc) — both sides skip.
-                # Both nodes independently detect this, so no message exchange needed.
                 continue
 
-            # --- Ancilla side ---
             if local_is_ancilla:
                 ancilla = self.local_qubits[r_loc][c_loc]
-                csock.send(stab_type)      # tell data side what type this is
+                csock.send(stab_type)
                 yield from conn.flush()
-
                 eA = epr_sock.create_keep()[0]
                 yield from conn.flush()
 
                 if stab_type == "xQ":
-                    # CNOT(data→ancilla): ancilla is TARGET
-                    # Cat-Ent A: CNOT(anc→eA), meas eA in Z, send m_A
-                    # Cat-DisEnt A: recv m_B, Z^m_B on anc
                     self._noise_cnot(ancilla, eA, (r_loc, c_loc), None, round_idx)
                     m_A = eA.measure()
                     yield from conn.flush()
@@ -385,9 +362,7 @@ class ClusterNodeProgram(Program):
                     if m_B == 1:
                         ancilla.Z()
                         tele_flip.add((r_loc, c_loc))
-
-                else:  # stab_type == "zQ": CNOT(ancilla→data), ancilla is CONTROL
-                    # Cat-Ent A: recv m_B, X^m_B on eA, CNOT(eA→anc), meas eA in X, send m_A
+                else:
                     m_B = int((yield from csock.recv()))
                     if m_B == 1:
                         eA.X()
@@ -397,18 +372,13 @@ class ClusterNodeProgram(Program):
                     yield from conn.flush()
                     csock.send(str(int(m_A)))
                     yield from conn.flush()
-
-            # --- Data side ---
             else:
-                signal = yield from csock.recv()   # "xQ" or "zQ" — never "skip" since skip is handled above without messaging
-
-                eB = epr_sock.recv_keep()[0]
+                signal = yield from csock.recv()
+                eB     = epr_sock.recv_keep()[0]
                 yield from conn.flush()
-                data = self.local_qubits[r_loc][c_loc]
+                data   = self.local_qubits[r_loc][c_loc]
 
                 if signal == "xQ":
-                    # CNOT(data→ancilla): data is CONTROL
-                    # Cat-Ent B: recv m_A, X^m_A on eB, CNOT(data→eB), meas eB in X, send m_B
                     m_A = int((yield from csock.recv()))
                     if m_A == 1:
                         eB.X()
@@ -418,10 +388,7 @@ class ClusterNodeProgram(Program):
                     yield from conn.flush()
                     csock.send(str(int(m_B)))
                     yield from conn.flush()
-
-                else:  # signal == "zQ": CNOT(ancilla→data), data is TARGET
-                    # Cat-Ent B: CNOT(data→eB), meas eB in Z, send m_B
-                    # Cat-DisEnt B: recv m_A, Z^m_A on data → tracked in z_applied
+                else:
                     self._noise_cnot(data, eB, (r_loc, c_loc), None, round_idx)
                     m_B = eB.measure()
                     yield from conn.flush()
@@ -438,27 +405,22 @@ class ClusterNodeProgram(Program):
         return z_applied, x_applied, tele_flip
 
     # ------------------------------------------------------------------ #
-    #  SVD payload                                                         #
+    #  Local system builder                                               #
     # ------------------------------------------------------------------ #
     def _build_local_system(self):
         B = self.layout_manager.block_size
-        r_node, c_node = self.node_coords
-        d_pos, zq_pos, xq_pos = [], [], []
-
         subgrid_data = self.layout_manager.get_subgrid_for_node(*self.node_coords)
-        actual_rows = len(subgrid_data)
-        actual_cols = len(subgrid_data[0]) if subgrid_data else B
+        actual_rows  = len(subgrid_data)
+        actual_cols  = len(subgrid_data[0]) if subgrid_data else B
 
+        d_pos, zq_pos, xq_pos = [], [], []
         for r in range(actual_rows):
             for c in range(actual_cols):
                 gr, gc = subgrid_data[r][c]["global_pos"]
                 role   = self.qubit_roles[r][c]
-                if role == "pQ":
-                    d_pos.append((gr, gc))
-                elif role == "zQ":
-                    zq_pos.append((gr, gc))
-                elif role == "xQ":
-                    xq_pos.append((gr, gc))
+                if   role == "pQ": d_pos.append((gr, gc))
+                elif role == "zQ": zq_pos.append((gr, gc))
+                elif role == "xQ": xq_pos.append((gr, gc))
 
         n = len(d_pos)
 
@@ -468,78 +430,158 @@ class ClusterNodeProgram(Program):
                 for j, (dr, dc) in enumerate(d_pos):
                     if abs(ar - dr) + abs(ac - dc) == 1:
                         H_block[i, j] = 1
+
             def _global_to_local(gr, gc):
                 for ri in range(actual_rows):
                     for ci in range(actual_cols):
                         if subgrid_data[ri][ci]["global_pos"] == (gr, gc):
                             return (ri, ci)
                 return None
+
             s_block = np.array(
                 [self.ancilla_measurements.get(_global_to_local(p[0], p[1]), 0)
                  for p in anc_pos],
                 dtype=int,
             )
             nonzero_rows = H_block.sum(axis=1) > 0
-            H_block = H_block[nonzero_rows]
-            s_block = s_block[nonzero_rows]
-            return H_block, s_block
+            return H_block[nonzero_rows], s_block[nonzero_rows]
 
         H_Z, s_Z = _make_H_and_s(zq_pos)
         H_X, s_X = _make_H_and_s(xq_pos)
         return H_Z, s_Z, H_X, s_X, d_pos
 
     # ------------------------------------------------------------------ #
-    #  Build FULL payloads — no SVD, send raw H                            #
+    #  Min-Sum Belief Propagation (local pre-filter)                       #
+    # ------------------------------------------------------------------ #
+    def _bp_local(self, H: np.ndarray, s: np.ndarray) -> np.ndarray:
+        """
+        Scaled Min-Sum BP on GF(2).
+
+        Returns e_hat — best hard-decision error estimate found.
+        Converges when (H @ e_hat) % 2 == s; otherwise returns the
+        last iterate (may be partial / wrong, but still useful as a
+        warm-start residual reduction).
+
+        Parameters
+        ----------
+        H : (m, n) binary parity-check matrix
+        s : (m,)  binary syndrome vector
+        """
+        m, n = H.shape
+        p    = self.NOISE_PROBABILITY
+        # Channel LLR: log P(bit=0) / P(bit=1)
+        ch_llr = np.full(n, np.log((1.0 - p) / p))
+
+        msg_v2c = np.zeros((m, n))   # variable → check messages
+        msg_c2v = np.zeros((m, n))   # check   → variable messages
+
+        e_hat = np.zeros(n, dtype=int)
+
+        for _ in range(self.BP_MAX_ITER):
+            # ── Check-node update (Scaled Min-Sum) ──────────────────────
+            for i in range(m):
+                neighbors = np.where(H[i] == 1)[0]
+                for j in neighbors:
+                    others = neighbors[neighbors != j]
+                    if len(others) == 0:
+                        msg_c2v[i, j] = 0.0
+                        continue
+                    # Sign: product of signs of incoming messages
+                    sign = 1
+                    for k in others:
+                        v = msg_v2c[i, k]
+                        sign *= (-1 if v < 0 else 1)
+                    # Account for syndrome bit: flip sign if s[i] == 1
+                    if s[i] == 1:
+                        sign *= -1
+                    # Magnitude: scaled minimum of absolute values
+                    magnitude = self.BP_ALPHA * float(
+                        np.min(np.abs(msg_v2c[i, others]))
+                    )
+                    msg_c2v[i, j] = sign * magnitude
+
+            # ── Variable-node update ─────────────────────────────────────
+            for j in range(n):
+                neighbors = np.where(H[:, j] == 1)[0]
+                total = ch_llr[j] + float(np.sum(msg_c2v[neighbors, j]))
+                for i in neighbors:
+                    msg_v2c[i, j] = total - msg_c2v[i, j]
+
+            # ── Hard decision ────────────────────────────────────────────
+            llr_total = ch_llr + msg_c2v.sum(axis=0)
+            e_hat     = (llr_total < 0).astype(int)
+
+            # ── Convergence check ────────────────────────────────────────
+            if np.all((H @ e_hat) % 2 == s):
+                return e_hat
+
+        return e_hat
+
+    # ------------------------------------------------------------------ #
+    #  Build full payloads with BP pre-filter                              #
     # ------------------------------------------------------------------ #
     def _build_full_payloads(self):
         """
-        Build payload dictionaries containing the full (un-compressed)
-        parity-check matrix H and syndrome s.
+        Build payload dictionaries.
 
-        The coordinator will perform SVD and dimensionality reduction on
-        its side before running OSD.
-
-        Payload fields
-        --------------
-        active          : bool  — False when H is empty or syndrome is all-zero
-        node_id         : [r, c]
-        error_type      : "X" or "Z"
-        H_full          : list[list[int]]  — full (m, n) GF(2) matrix
-        s               : list[int]        — syndrome vector length m
-        n               : int              — number of data qubits
-        data_positions  : list[[r, c]]
-        global_offset   : [r_offset, c_offset]
+        For each error type (X / Z):
+          1. Run Min-Sum BP on the local (H, s).
+          2. Compute s_residual = (s + H @ e_bp) % 2.
+          3a. If s_residual is all-zero:
+                BP solved it completely → active=False, bp_corrections set.
+                The coordinator will route these corrections back without SVD/OSD.
+          3b. Otherwise:
+                Send active=True with H_full and s_residual.
+                The coordinator runs SVD+OSD on the cleaner residual syndrome.
         """
         H_Z, s_Z, H_X, s_X, data_pos = self._build_local_system()
         r_node, c_node = self.node_coords
         B = self.layout_manager.block_size
 
         def _make_payload(H, s, error_type):
+            # Empty or all-zero syndrome — nothing to do
             if H.size == 0 or not np.any(s):
                 return {
-                    "active": False,
-                    "node_id": list(self.node_coords),
-                    "error_type": error_type,
+                    "active":         False,
+                    "node_id":        list(self.node_coords),
+                    "error_type":     error_type,
                     "data_positions": [list(p) for p in data_pos],
+                    "bp_corrections": [],
                 }
+
+            # Run Min-Sum BP
+            e_bp       = self._bp_local(H, s)
+            s_residual = (s + H @ e_bp) % 2
+
+            if not np.any(s_residual):
+                # BP converged — send corrections, no H needed
+                bp_corr = [list(data_pos[j]) for j in range(len(e_bp)) if e_bp[j] == 1]
+                return {
+                    "active":         False,
+                    "node_id":        list(self.node_coords),
+                    "error_type":     error_type,
+                    "data_positions": [list(p) for p in data_pos],
+                    "bp_corrections": bp_corr,
+                }
+
+            # BP did not converge — send full H with residual syndrome
             m, n = H.shape
-            print(f"[{self.node_coords}] Sending full H ({m}×{n}) "
-                  f"for {error_type}-type errors (no local SVD)")
             return {
-                "active": True,
-                "node_id": list(self.node_coords),
-                "error_type": error_type,
-                "H_full": H.tolist(),
-                "s": s.tolist(),
-                "n": n,
+                "active":         True,
+                "node_id":        list(self.node_coords),
+                "error_type":     error_type,
+                "H_full":         H.tolist(),
+                "s":              s_residual.tolist(),
+                "n":              n,
                 "data_positions": [list(p) for p in data_pos],
-                "global_offset": [r_node * B, c_node * B],
+                "global_offset":  [r_node * B, c_node * B],
+                "bp_corrections": [list(data_pos[j]) for j in range(len(e_bp)) if e_bp[j] == 1],
             }
 
         return _make_payload(H_Z, s_Z, "X"), _make_payload(H_X, s_X, "Z")
 
     # ------------------------------------------------------------------ #
-    #  Communicate with coordinator  (unchanged)                           #
+    #  Communicate with coordinator                                        #
     # ------------------------------------------------------------------ #
     def _communicate_with_coordinator(self, context, payload_X, payload_Z):
         csock = context.csockets[self.coordinator_name]
@@ -551,16 +593,15 @@ class ClusterNodeProgram(Program):
         return json.loads(msg_X), json.loads(msg_Z)
 
     # ------------------------------------------------------------------ #
-    #  Apply corrections  (unchanged)                                      #
+    #  Apply corrections                                                 #
     # ------------------------------------------------------------------ #
     def _apply_corrections(self, corrections: list, gate: str = "X"):
-        r_node, c_node = self.node_coords
-        B = self.layout_manager.block_size
+        B            = self.layout_manager.block_size
         subgrid_data = self.layout_manager.get_subgrid_for_node(*self.node_coords)
-        r_start = subgrid_data[0][0]["global_pos"][0]
-        c_start = subgrid_data[0][0]["global_pos"][1]
-        self.B_rows = len(subgrid_data)
-        self.B_cols = len(subgrid_data[0]) if subgrid_data else B
+        r_start      = subgrid_data[0][0]["global_pos"][0]
+        c_start      = subgrid_data[0][0]["global_pos"][1]
+        self.B_rows  = len(subgrid_data)
+        self.B_cols  = len(subgrid_data[0]) if subgrid_data else B
         for r_global, c_global in corrections:
             if (r_start <= r_global < r_start + self.B_rows
                     and c_start <= c_global < c_start + self.B_cols):
@@ -575,13 +616,13 @@ class ClusterNodeProgram(Program):
                         self.applied_Z_corrections.add((r_local, c_local))
 
     # ------------------------------------------------------------------ #
-    #  Logical-Z parity  (unchanged)                                       #
+    #  Logical-Z parity                                                   #
     # ------------------------------------------------------------------ #
     def _send_logical_parity(self, context, x_parity=None):
-        csock = context.csockets[self.coordinator_name]
+        csock        = context.csockets[self.coordinator_name]
         r_node, c_node = self.node_coords
         subgrid_data = self.layout_manager.get_subgrid_for_node(*self.node_coords)
-        actual_rows = len(subgrid_data)
+        actual_rows  = len(subgrid_data)
 
         if c_node != 0:
             csock.send(json.dumps(-1))
@@ -598,7 +639,7 @@ class ClusterNodeProgram(Program):
         yield from context.connection.flush()
 
     # ------------------------------------------------------------------ #
-    #  Noise helpers  (unchanged)                                          #
+    #  Noise helpers                                                     #
     # ------------------------------------------------------------------ #
     def _noisy_H(self, qubit, r, c):
         qubit.H()
@@ -623,11 +664,13 @@ class ClusterNodeProgram(Program):
             qubits_and_coords = [(qubit1, coords1), (qubit2, coords2)]
             for qb, coords in qubits_and_coords:
                 choice = random.choice(["X", "Y", "Z", "I"])
+
                 def toggle_error(error_set, pos):
                     if pos in error_set:
                         error_set.remove(pos)
                     else:
                         error_set.add(pos)
+
                 is_local_data = (
                     coords is not None
                     and 0 <= coords[0] < self.layout_manager.block_size
