@@ -15,18 +15,18 @@ poly = np.poly1d(coeffs)
 x_line = np.linspace(nodes.min(), nodes.max(), 100)
 y_line = poly(x_line)
 
-plt.figure(figsize=(10, 6))
+plt.figure(figsize=(8, 4))
 
 plt.scatter(nodes, cnot_counts, color='red', label='Simulation Data', zorder=5)
 plt.plot(x_line, y_line, "b--", label='Trend (2nd-degree polynomial)')
 
-plt.title('Scaling of CNOT count vs number of QPUs (Surface Code 13x13)', fontsize=14)
-plt.xlabel('Number of QPUs (Nodes)', fontsize=12)
-plt.ylabel('Total number of CNOT gates', fontsize=12)
-plt.grid(True, linestyle=':', alpha=0.6)
+plt.title('Scaling of CNOT count vs number of QPUs (Surface Code 13x13)', fontsize=16)
+plt.xlabel('Number of QPUs (Nodes)', fontsize=14)
+plt.ylabel('Total number of CNOT gates', fontsize=14)
+plt.grid(True, linestyle=':', alpha=0.7)
 plt.legend()
 
 plt.xscale('log', base=2)
 
-plt.savefig('cnot_qpu_plot.png', dpi=300)
-print('Plot saved successfully to cnot_qpu_plot.png')
+plt.savefig('cnot_qpu_plot.eps', dpi=300)
+print('Plot saved successfully to cnot_qpu_plot.eps')
