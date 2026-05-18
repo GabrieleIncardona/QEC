@@ -28,5 +28,5 @@ plt.legend()
 
 plt.xscale('log', base=2)
 
-plt.savefig('cnot_qpu_plot.png', dpi=300)  # High resolution for thesis
+plt.savefig('cnot_qpu_plot.png', dpi=300)
 print('Plot saved successfully to cnot_qpu_plot.png')
