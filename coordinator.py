@@ -39,9 +39,23 @@ class CoordinatorProgram(Program):
 
         # Step 2: assemble block-diagonal system and run OSD separately for X and Z errors
         for payloads, error_type in [(payloads_X, "X"), (payloads_Z, "Z")]:
-            H_global, s_global, registry = self._assemble_global_system(payloads)
+            active_nodes = [(p["node_id"], p.get("s", []), "H_reduced" in p)
+                           for p in payloads if p.get("active", False)]
+            inactive_nodes = [(p["node_id"], p.get("bp_corrections", []))
+                             for p in payloads if not p.get("active", False)]
+            print(f"\n[coordinator] {error_type}-errors: "
+                  f"active={[n for n,s,_ in active_nodes]} "
+                  f"(syndromes len={[len(s) for _,s,_ in active_nodes]}), "
+                  f"inactive={[n for n,_ in inactive_nodes]} "
+                  f"(bp_corr={[len(c) for _,c in inactive_nodes]})")
+            H_global, s_global, llr_global, registry = self._assemble_global_system(payloads)
             if H_global is not None:
-                e_global = self._osd_gf2(H_global, s_global)
+                e_global = self._osd_gf2(H_global, s_global, llr_global=llr_global)
+                K_tot = H_global.shape[1]
+                if np.sum(e_global) > K_tot // 2:
+                    print(f"[coordinator] WARNING: OSD returned {np.sum(e_global)}/{K_tot} corrections "
+                          f"for {error_type}-errors — discarding (likely degenerate system)")
+                    e_global = np.zeros_like(e_global)
                 corrections = self._project_corrections(e_global, registry) if np.any(e_global) else {}
             else:
                 corrections = {}
@@ -58,17 +72,22 @@ class CoordinatorProgram(Program):
         status = "OK — no logical error" if global_parity == 0 else "FAIL — logical error survived!"
         print(f"\n=== Logical Z (global) = {global_parity} → {status} ===\n")
 
-        #yield from context.connection.flush()
-        #return global_parity
-
-        # Step 7: aggregate CNOT counts from all nodes
+        # Step 7: aggregate CNOT counts
         global_cnot_count = 0
         for name in self.node_names:
             msg = yield from context.csockets[name].recv()
             global_cnot_count += json.loads(msg)
- 
         print(f"=== Global CNOT count = {global_cnot_count} ===\n")
- 
+
+        # Step 8: aggregate decoding times
+        max_time = 0
+        for name in self.node_names:
+            msg = yield from context.csockets[name].recv()
+            node_time = json.loads(msg)
+            if node_time > max_time:
+                max_time = node_time
+        print(f"=== Max decoding time across nodes = {max_time:.2f} seconds ===\n")
+
         yield from context.connection.flush()
         return global_parity, global_cnot_count
 
@@ -76,21 +95,27 @@ class CoordinatorProgram(Program):
     def _assemble_global_system(self, payloads: list) -> tuple:
         active = [p for p in payloads if p.get("active", False)]
         if not active:
-            return None, None, []
+            return None, None, None, []
 
-        H_blocks, s_list, registry = [], [], []
-        col_offset = 0                                      # Column offset for each block in the global H, used for back-projection of corrections
+        H_blocks, s_list, llr_list, registry = [], [], [], []
+        col_offset = 0
 
         for p in active:
-            H_red = np.array(p["H_reduced"])   # (m_i, k_i)
-            V_k = np.array(p["V_k"])          # (n_i, k_i)
-            s_i = np.array(p["s"], dtype=int)
+            H_red_raw = np.array(p["H_reduced"], dtype=float)
+            V_k = np.array(p["V_k"], dtype=float)
             k_i = int(p["k"])
+            H_red = (np.abs(np.round(H_red_raw).astype(int)) % 2).astype(int)
+            s_i = np.array(p["s"], dtype=int)
 
             H_blocks.append(H_red)
             s_list.extend(s_i.tolist())
 
-            registry.append({                                # Store info needed for back-projection of corrections to each node
+            if "llr" in p and len(p["llr"]) == k_i:
+                llr_list.extend(p["llr"])
+            else:
+                llr_list.extend([0.0] * k_i)
+
+            registry.append({
                 "node_id":        tuple(p["node_id"]),
                 "V_k":            V_k,
                 "data_positions": [tuple(pos) for pos in p["data_positions"]],
@@ -99,92 +124,108 @@ class CoordinatorProgram(Program):
             })
             col_offset += k_i
 
-        H_global = block_diag(*H_blocks)        # Block-diagonal global parity-check matrix
-        s_global = np.array(s_list, dtype=int)  # Global syndrome vector
-        return H_global, s_global, registry     # Return registry for back-projection of corrections
+        H_global  = block_diag(*H_blocks)
+        s_global  = np.array(s_list, dtype=int)
+        llr_global = np.array(llr_list, dtype=float)
+        return H_global, s_global, llr_global, registry
 
-    # Step 3 — OSD over GF(2)
-    def _osd_gf2(self, H_global: np.ndarray, s_global: np.ndarray, osd_order: int = 2) -> np.ndarray:
+    # Step 3 — Soft-decision OSD over GF(2)
+    def _osd_gf2(self, H_global: np.ndarray, s_global: np.ndarray,
+                 llr_global: np.ndarray = None, osd_order: int = 2) -> np.ndarray:
         m, K_tot = H_global.shape
-
         H = H_global.astype(int) % 2
         s = s_global.astype(int) % 2
 
-        # --- Gaussian elimination over GF(2) ---
-        H_sys, s_sys = H.copy(), s.copy()
-        pivot_cols = []
-        pivot_rows = []
+        if llr_global is not None and len(llr_global) == K_tot:
+            reliability = np.abs(llr_global)
+        else:
+            reliability = np.ones(K_tot)
+
+        col_order = np.argsort(-reliability)
+        inv_order  = np.empty(K_tot, dtype=int)
+        inv_order[col_order] = np.arange(K_tot)
+
+        H_ord = H[:, col_order].copy()
+        H_sys, s_sys = H_ord.copy(), s.copy()
+        pivot_cols, pivot_rows = [], []
         row = 0
 
         for col in range(K_tot):
             if row >= m:
                 break
-            # Find a row with a 1 in this column
             found = next((r for r in range(row, m) if H_sys[r, col] == 1), -1)
             if found == -1:
                 continue
-            # Swap
             H_sys[[row, found]] = H_sys[[found, row]]
             s_sys[[row, found]] = s_sys[[found, row]]
-            # Eliminate column in all other rows
             for r2 in range(m):
                 if r2 != row and H_sys[r2, col] == 1:
                     H_sys[r2] = (H_sys[r2] + H_sys[row]) % 2
-                    s_sys[r2] = (s_sys[r2] + s_sys[row]) % 2
+                    s_sys[r2]  = (s_sys[r2]  + s_sys[row])  % 2
             pivot_cols.append(col)
             pivot_rows.append(row)
             row += 1
 
-        non_pivot = [c for c in range(K_tot) if c not in pivot_cols]            # Columns corresponding to free variables (non-pivots)
-        test_cols = non_pivot[:osd_order]                                       # Columns to test for flipping in OSD (limited by osd_order)
+        non_pivot = [c for c in range(K_tot) if c not in pivot_cols]
+        non_pivot_sorted = sorted(non_pivot, key=lambda c: reliability[col_order[c]])
+        test_cols = non_pivot_sorted[:osd_order]
         n_test = len(test_cols)
 
-        best_weight = K_tot + 1
-        best_e = np.zeros(K_tot, dtype=int)
+        def soft_cost(e_ord):
+            return float(np.sum(reliability[col_order] * e_ord))
 
-        # --- Enumerate test patterns on free (non-pivot) columns ---
+        best_cost = float("inf")
+        best_e_ord = np.zeros(K_tot, dtype=int)
+
         for pattern in range(2 ** n_test):
-            e = np.zeros(K_tot, dtype=int)
+            e_ord = np.zeros(K_tot, dtype=int)
             for b, tc in enumerate(test_cols):
-                e[tc] = (pattern >> b) & 1              # Set test pattern bits in e for the selected free columns
-
-            # Solve pivot bits mod 2
+                e_ord[tc] = (pattern >> b) & 1
             for pc, pr in zip(pivot_cols, pivot_rows):
                 rhs = s_sys[pr]
                 for fc in non_pivot:
-                    rhs = (rhs + H_sys[pr, fc] * e[fc]) % 2         # Update rhs by adding contributions from free variables
-                e[pc] = rhs
+                    rhs = (rhs + H_sys[pr, fc] * e_ord[fc]) % 2
+                e_ord[pc] = rhs
+            cost = soft_cost(e_ord)
+            if cost < best_cost:
+                best_cost  = cost
+                best_e_ord = e_ord.copy()
 
-            weight = int(np.sum(e))
-            if weight < best_weight:
-                best_weight = weight
-                best_e = e.copy()
-
-        return best_e
+        return best_e_ord[inv_order]
 
     # Step 4 — Back-project global error to per-node corrections
     def _project_corrections(self, e_global: np.ndarray, registry: list) -> dict:
         corrections = {}
         for reg in registry:
-            e_block = e_global[reg["col_start"]:reg["col_end"]]   # shape (k,)
-            V_k = reg["V_k"]                                      # shape (n, k)
-
-            # Back-project from reduced space to full data-qubit space and binarise.
-            # V_k @ e_block maps the k-dimensional correction back to n data qubits.
-            # We round the absolute value and take mod 2 to recover a GF(2) vector.
-            e_local = (np.round(np.abs(np.array(V_k, dtype=float) @ e_block.astype(float))) % 2).astype(int)
-
+            e_block = e_global[reg["col_start"]:reg["col_end"]]
+            V_k = reg["V_k"]
+            e_local = (np.abs(np.round(np.array(V_k, dtype=float) @ e_block.astype(float)).astype(int)) % 2).astype(int)
             corrections[reg["node_id"]] = [
                 list(reg["data_positions"][j])
                 for j in range(len(e_local)) if e_local[j] == 1
             ]
         return corrections
-    
-    # Step 5 — Send corrections to nodes
+
+    # Step 5 — Send corrections merging OSD + BP
     def _send_corrections(self, context: ProgramContext, payloads: list, corrections_per_node: dict):
+        """Merge OSD corrections (active nodes) with BP corrections (inactive/converged nodes)."""
+        bp_map: dict = {}
+        for p in payloads:
+            node_id = tuple(p["node_id"])
+            if p.get("active", False):
+                continue
+            bp_corrs = p.get("bp_corrections", [])
+            if bp_corrs:
+                existing = bp_map.get(node_id, [])
+                bp_map[node_id] = existing + bp_corrs
+
         for name in self.node_names:
             parts = name.replace("node_", "").split("_")
             node_id = (int(parts[0]), int(parts[1]))
-            corr = corrections_per_node.get(node_id, [])
-            context.csockets[name].send(json.dumps(corr))
+            osd_corr = corrections_per_node.get(node_id, [])
+            bp_corr  = bp_map.get(node_id, [])
+            osd_set = set(tuple(c) for c in osd_corr)
+            bp_set  = set(tuple(c) for c in bp_corr)
+            merged  = list(osd_set.symmetric_difference(bp_set))
+            context.csockets[name].send(json.dumps(merged))
         yield from context.connection.flush()

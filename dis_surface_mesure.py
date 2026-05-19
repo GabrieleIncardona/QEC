@@ -1,6 +1,7 @@
 import json
 import random
 import numpy as np
+import time as t
 
 from squidasm.sim.stack.program import Program, ProgramContext, ProgramMeta
 from netqasm.sdk.qubit import Qubit
@@ -9,6 +10,8 @@ from netqasm.sdk.qubit import Qubit
 class ClusterNodeProgram(Program):
     ENERGY_THRESHOLD  = 0.98       # fraction of total energy to retain in SVD dimensionality reduction (0 < threshold <= 1)
     NUM_ROUNDS        = 2           # number of rounds of stabilizer measurements (for spacetime decoding)
+    BP_ALPHA          = 0.75        # Min-Sum scaling factor
+    BP_MAX_ITER       = 20          # max BP iterations
 
     def __init__(self, node_coords: tuple, layout_manager, error, prob,
                  coordinator_name: str = "coordinator"):
@@ -17,7 +20,6 @@ class ClusterNodeProgram(Program):
         self.coordinator_name = coordinator_name
         self.error = error
         self.NOISE_PROBABILITY = prob       # probability of X error on each data qubit before stabilizer measurements
-        self.cnot_count = 0                 # the cnot local counter
 
         r, c = node_coords
         N = layout_manager.nodes_per_side
@@ -36,10 +38,7 @@ class ClusterNodeProgram(Program):
         actual_cols = len(subgrid_data[0]) if subgrid_data else B
         # print(f"{self.node_coords} subgrid size: {actual_rows} rows x {actual_cols} cols")
         actual_qubits = actual_rows * actual_cols
-        if self.neighbors:
-            border_eprs = max(actual_rows, actual_cols)  # max EPR qubits on one border
-        else:
-            border_eprs = 0  # no neighbors → no TeleGate → no EPR qubits needed
+        border_eprs = max(actual_rows, actual_cols)  # max EPR qubits on one border
         return ProgramMeta(
             name = f"node_{self.node_coords[0]}_{self.node_coords[1]}",
             csockets = self.neighbors + [self.coordinator_name],
@@ -103,12 +102,10 @@ class ClusterNodeProgram(Program):
                             for r in range(self.B_rows):
                                 for c in range(self.B_cols):
                                     if self.qubit_roles[r][c]== "pQ":
-                                                    # simulate a Hadamard error
-                                                    self._noisy_H(self.local_qubits[r][c], r, c)
-                                                    # apply Hadamard again; doing two noisy H applications
-                                                    # approximates an imperfect H gate while keeping
-                                                    # the ideal H^2 = I behaviour
-                                                    self._noisy_H(self.local_qubits[r][c], r, c)
+                                        # simulation a hadamard error
+                                        self._noisy_H(self.local_qubits[r][c], r, c)
+                                        # applay 2 time hadamard, in this way, HIH = I, but we applay error
+                                        self._noisy_H(self.local_qubits[r][c], r, c)
 
                         case "initialization":
                             print(f"[{self.node_coords}] initialization error: simulating by flipping all ancilla measurements in round 2.")
@@ -132,7 +129,7 @@ class ClusterNodeProgram(Program):
                         
                         # Add error on ancilla initialization if the user selected it and the error occurs:
                         if (self.error == "initialization" or self.error == "all") and random.random() < self.NOISE_PROBABILITY and round_idx == 1:
-                            # For simplicity, we model ancilla initialization error as an X error for zQ ancillas and a Z error for xQ ancillas. This means the ancilla starts in the wrong state (|1⟩ instead of |0⟩ for zQ, or |−⟩ instead of |+⟩ for xQ), which will flip the measurement outcome and simulate an initialization error.
+                            # For simplicity, we model ancilla initialization error as an X error for zQ ancillas and a Z error for xQ ancillas. This means the ancilla starts in the wrong state (|1⟩ instead of |0⟩ for zQ, or |−⟩ instead of |+⟩ for xQ), which will flip the measurement outcome and simulate a inizialization error.
                             if role == "zQ":
                                 ancilla.X()
                                 print(f"[{self.node_coords}] Noise: X error on zQ ancilla at ({r}, {c})")
@@ -197,13 +194,13 @@ class ClusterNodeProgram(Program):
 
                     yield from conn.flush()
 
-                    # 2. Apply readout error if the user selected it and the error occurs:
+                    # 2. Applay readout error if the user selected it and the error occurs:
                     if (self.error == "readout" or self.error == "all") and random.random() < self.NOISE_PROBABILITY and round_idx == 1:
                         m = 1 - m  # flip the measurement result
                         print(f"[{self.node_coords}] Error flip at: ({r}, {c})")
                     raw = int(m)
 
-                    # Z compensation for xQ: Z anticommutes with X.
+                    # Z compensation for xQ: Z anticommutes with X
                     # Each neighboring data qubit with odd z_parity contributes
                     # a flip to the xQ measurement (because Z|ψ⟩ in X basis → flip).
                     if role == "xQ":
@@ -244,8 +241,10 @@ class ClusterNodeProgram(Program):
               f"{active_final if active_final else 'clean'}")
 
         # ── 5. SVD payload and corrections ────────────────────────────────
+        t_start = t.time()
         payload_X, payload_Z = self._build_svd_payloads()
         corr_X, corr_Z = yield from self._communicate_with_coordinator(context, payload_X, payload_Z)
+        t_end = t.time()
         self._apply_corrections(corr_X, gate="X")
         self._apply_corrections(corr_Z, gate="Z")
         yield from conn.flush()   # materialise correction gates before measurement
@@ -265,6 +264,10 @@ class ClusterNodeProgram(Program):
 
         # ── 7. Send CNOT count to coordinator ────────────────────────────
         context.csockets[self.coordinator_name].send(json.dumps(self.cnot_count))
+        yield from conn.flush()
+
+        # ── 8. Send decoding time to coordinator ─────────────────────────
+        context.csockets[self.coordinator_name].send(json.dumps(t_end - t_start))
         yield from conn.flush()
 
     # ------------------------------------------------------------------ #
@@ -358,7 +361,7 @@ class ClusterNodeProgram(Program):
 
         for idx in range(border_len):
             r_loc, c_loc = (idx, local_fixed) if axis == "col" else (local_fixed, idx)
-            # print(f"[{self.node_coords}] Border idx {idx} at local ({r_loc}, {c_loc})")
+            #print(f"[{self.node_coords}] Border idx {idx} at local ({r_loc}, {c_loc})")
             r_glob, c_glob = subgrid_data[r_loc][c_loc]["global_pos"]
             local_role = self.qubit_roles[r_loc][c_loc]
 
@@ -459,63 +462,46 @@ class ClusterNodeProgram(Program):
                             z_applied.add((r_loc, c_loc))
 
         return z_applied, x_applied, tele_flip
-    
-    def _bp_local(self, H: np.ndarray, s: np.ndarray, max_iter: int = 20) -> np.ndarray:
-        """
-        Belief Propagation over GF(2) — Min-Sum decoder.
-        """
-        m, n = H.shape
-        p = self.NOISE_PROBABILITY
-        ch_llr = np.full(n, np.log((1 - p) / p))
 
+    def _bp_local(self, H: np.ndarray, s: np.ndarray) -> np.ndarray:
+        """Scaled Min-Sum BP on GF(2). Returns best hard-decision error estimate."""
+        m, n = H.shape
+        p_safe = np.clip(self.NOISE_PROBABILITY, 1e-10, 1 - 1e-10)
+        ch_llr = np.full(n, np.log((1.0 - p_safe) / p_safe))
         msg_v2c = np.zeros((m, n))
         msg_c2v = np.zeros((m, n))
-
-        for _ in range(max_iter):
-            # Check-node update — Min-Sum
+        e_hat = np.zeros(n, dtype=int)
+        for _ in range(self.BP_MAX_ITER):
             for i in range(m):
                 neighbors = np.where(H[i] == 1)[0]
                 for j in neighbors:
-                    others = [k for k in neighbors if k != j]
-                    if not others:
+                    others = neighbors[neighbors != j]
+                    if len(others) == 0:
                         msg_c2v[i, j] = 0.0
                         continue
-                    # Sign: product of the signs of incoming messages
                     sign = 1
                     for k in others:
-                        sign *= np.sign(msg_v2c[i, k]) if msg_v2c[i, k] != 0 else 1
-                    # Magnitude: minimum of absolute values
-                    magnitude = min(abs(msg_v2c[i, k]) for k in others)
+                        sign *= (-1 if msg_v2c[i, k] < 0 else 1)
+                    if s[i] == 1:
+                        sign *= -1
+                    magnitude = self.BP_ALPHA * float(np.min(np.abs(msg_v2c[i, others])))
                     msg_c2v[i, j] = sign * magnitude
-
-            # Variable-node update — invariato
             for j in range(n):
                 neighbors = np.where(H[:, j] == 1)[0]
-                total = ch_llr[j] + sum(msg_c2v[i, j] for i in neighbors)
+                total = ch_llr[j] + float(np.sum(msg_c2v[neighbors, j]))
                 for i in neighbors:
                     msg_v2c[i, j] = total - msg_c2v[i, j]
-
-            # Hard decision
             llr_total = ch_llr + msg_c2v.sum(axis=0)
             e_hat = (llr_total < 0).astype(int)
-
-            # Check convergence
             if np.all((H @ e_hat) % 2 == s):
                 return e_hat
-
         return e_hat
+
     # ------------------------------------------------------------------ #
     #  SVD payload                                                         #
     # ------------------------------------------------------------------ #
     def _build_local_system(self) -> tuple:
         """Build the parity-check system for this node.
-
-        Returns H, s, d_pos where:
-          - H: binary parity-check matrix, shape (num_ancilla, num_data)
-          - s: syndrome vector, shape (num_ancilla,)
-          - d_pos: list of global (row, col) positions of data qubits
-
-        KEY DESIGN DECISION — separate xQ and zQ rows:
         -----------------------------------------------
         xQ ancillas implement X stabilizers and detect Z errors.
         zQ ancillas implement Z stabilizers and detect X errors.
@@ -531,6 +517,7 @@ class ClusterNodeProgram(Program):
         zq_pos = []     # positions of zQ ancillas (detect X errors)
         xq_pos = []     # positions of xQ ancillas (detect Z errors)
 
+        # use actual subgrid dimensions so border nodes include all their qubits.
         # The global position of qubit (r,c) in this node is derived from subgrid_data
         # to avoid the r_node*B offset being wrong for non-square partitions.
         subgrid_data = self.layout_manager.get_subgrid_for_node(*self.node_coords)
@@ -556,7 +543,7 @@ class ClusterNodeProgram(Program):
             for i, (ar, ac) in enumerate(anc_pos):
                 for j, (dr, dc) in enumerate(d_pos):
                     if abs(ar - dr) + abs(ac - dc) == 1:
-                        H_block[i, j] = 1                   # This ancilla is connected to this data qubit → 1 in H
+                        H_block[i, j] = 1                   # This ancilla is connected to this data qubit → 1 in H.
             # Convert each ancilla global position back to local using the actual subgrid.
             def _global_to_local(gr, gc):
                 for ri in range(actual_rows):
@@ -570,7 +557,8 @@ class ClusterNodeProgram(Program):
                  for p in anc_pos],
                 dtype=int,
             )
-            # Remove rows with zero syndrome (inactive stabilizers that don't detect any errors in this round and
+
+            # remove rows with all zeros (border ancillas whose neighbors
             # are entirely on another node's subgrid). These rows have no
             # data-qubit column to assign an error to, so they only add
             # inconsistent constraints to the OSD solver.
@@ -594,57 +582,40 @@ class ClusterNodeProgram(Program):
             if H.size == 0 or not np.any(s):
                 return {"active": False, "node_id": list(self.node_coords),
                         "error_type": error_type,
-                        "data_positions": [list(p) for p in data_pos]}
-            e_bp = self._bp_local(H, s, max_iter=20)
+                        "data_positions": [list(p) for p in data_pos],
+                        "bp_corrections": []}
+
+            # 1. Run local BP
+            e_bp = self._bp_local(H, s)
             s_residual = (s + H @ e_bp) % 2
+            bp_corrections = [list(data_pos[j]) for j in range(len(e_bp)) if e_bp[j] == 1]
 
             if not np.any(s_residual):
-                # BP solved everything: send the corrections to the coordinator
-                # which will back-project them as usual
-                bp_corrections = [list(data_pos[j]) for j in range(len(e_bp)) if e_bp[j] == 1]
-                return {
-                    "active": False,
-                    "node_id": list(self.node_coords),
-                    "error_type": error_type,
-                    "data_positions": [list(p) for p in data_pos],
-                    "bp_corrections": bp_corrections,   # ← corrections to apply
-                }
+                # BP converged — no SVD needed
+                return {"active": False, "node_id": list(self.node_coords),
+                        "error_type": error_type,
+                        "data_positions": [list(p) for p in data_pos],
+                        "bp_corrections": bp_corrections}
 
-            m, n = H.shape
+            # 2. BP did not converge — SVD on residual
+            m_h, n_h = H.shape
             U, sigma, Vt = np.linalg.svd(H.astype(float), full_matrices=False)
-            max_k = Vt.shape[0]
             total_energy = np.sum(sigma ** 2)
-            k = max_k
+            max_k = min(m_h, n_h)
             if total_energy > 1e-10:
                 cumulative = np.cumsum(sigma ** 2)
                 k = min(int(np.searchsorted(cumulative, energy_threshold * total_energy) + 1), max_k)
-            print(f"k: {k} / {n} captures {cumulative[k-1] / total_energy:.2%} energy for {error_type}-type errors at node {self.node_coords}")
+            else:
+                k = max_k
 
-            # Select k most informative columns of H via SVD-guided greedy ranking.
-            # Vt rows are right-singular vectors; the column of H with highest weight
-            # in each leading mode captures the most variance. We pick one unique column
-            # per mode, preserving the GF(2) structure of H for the OSD solver.
-            selected_cols = []
-            for i in range(k):
-                for j in np.argsort(-np.abs(Vt[i])):
-                    if j not in selected_cols:
-                        selected_cols.append(int(j))
-                        break
-            for j in range(n):
-                if len(selected_cols) >= k:
-                    break
-                if j not in selected_cols:
-                    selected_cols.append(j)
+            energy_retained = np.cumsum(sigma**2)[k-1] / total_energy if total_energy > 1e-10 else 1.0
+            print(f"[{self.node_coords}] Local SVD ({error_type}): k={k}/{n_h} "
+                  f"({energy_retained:.2%} energy retained)")
 
-            H_reduced = H[:, selected_cols].astype(int)   # (m, k) GF(2) submatrix
-
-            # V_k: sparse (n, k) back-projection matrix.
-            # V_k[selected_cols[i], i] = 1 so that the coordinator's
-            # round(|V_k @ e_block|) % 2 correctly maps each reduced-space bit
-            # back to its original data-qubit position.
-            V_k = np.zeros((n, k), dtype=float)
-            for i, col in enumerate(selected_cols):
-                V_k[col, i] = 1.0
+            U_k = U[:, :k]
+            Sig_k = np.diag(sigma[:k])
+            H_reduced = U_k @ Sig_k   # (m, k) real-valued
+            V_k = Vt[:k, :].T         # (n, k)
 
             r_node, c_node = self.node_coords
             B = self.layout_manager.block_size
@@ -655,6 +626,8 @@ class ClusterNodeProgram(Program):
                 "s": s_residual.tolist(), "k": k,
                 "data_positions": [list(p) for p in data_pos],
                 "global_offset": [r_node * B, c_node * B],
+                "bp_corrections": bp_corrections,
+                "llr": (U_k @ Sig_k @ Vt[:k, :]).diagonal().tolist() if k <= n_h else [],
             }
 
         return _make_payload(H_Z, s_Z, "X"), _make_payload(H_X, s_X, "Z")
@@ -671,7 +644,6 @@ class ClusterNodeProgram(Program):
     def _apply_corrections(self, corrections: list, gate: str = "X"):
         r_node, c_node = self.node_coords
         B = self.layout_manager.block_size
-
         subgrid_data = self.layout_manager.get_subgrid_for_node(*self.node_coords)
         r_start = subgrid_data[0][0]["global_pos"][0]
         c_start = subgrid_data[0][0]["global_pos"][1]
@@ -694,17 +666,6 @@ class ClusterNodeProgram(Program):
     #  Logical-Z parity                                                    #
     # ------------------------------------------------------------------ #
     def _send_logical_parity(self, context, x_parity=None):
-        """
-        Compute the logical-Z parity via physical Z-basis measurements.
-
-        Z̄ = tensor product of Z on all data qubits along the leftmost column
-        of the global grid (local column 0 of nodes with c_node == 0).
-
-        The zQ TeleGate applies Z byproducts to data qubits on the border.
-        These are tracked in x_parity (passed as z_parity from the caller).
-        We XOR the measured parity with the accumulated Z byproducts on each
-        data qubit in the logical column to get the true logical parity.
-        """
         csock = context.csockets[self.coordinator_name]
         r_node, c_node = self.node_coords
         B = self.layout_manager.block_size
@@ -721,11 +682,6 @@ class ClusterNodeProgram(Program):
                 outcome = self.local_qubits[r][0].measure()
                 yield from context.connection.flush()
                 measured = int(outcome)
-                # Compensate Z byproducts from TeleGate that were applied to this
-                # data qubit and tracked in z_parity (passed as x_parity parameter).
-                # A Z gate on a qubit in |0⟩/|1⟩ basis flips the measurement result.
-                #if x_parity is not None and x_parity[r][0] == 1:
-                #    measured ^= 1
                 parity ^= measured
 
             print(f"[{self.node_coords}] Logical-Z physical parity = {parity}")
