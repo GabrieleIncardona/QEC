@@ -7,6 +7,7 @@ back-projects corrections to each node via the stored V_k matrices.
 
 import json
 import numpy as np
+import time as t
 from scipy.linalg import block_diag
 
 from squidasm.sim.stack.program import Program, ProgramContext, ProgramMeta
@@ -27,7 +28,9 @@ class CoordinatorProgram(Program):
             max_qubits=1,       # SquidASM requires at least 1 qubit, but the coordinator doesn't actually use it. We just won't do anything with it.
         )
     
-    # Run
+    # ------------------------------------------------------------------ #
+    #  Run                                                                 #
+    # ------------------------------------------------------------------ #
     def run(self, context: ProgramContext):
         # Step 1: receive payloads
         payloads_X, payloads_Z = [], []
@@ -36,9 +39,12 @@ class CoordinatorProgram(Program):
             msg_Z = yield from context.csockets[name].recv()
             payloads_X.append(json.loads(msg_X))
             payloads_Z.append(json.loads(msg_Z))
+        
+        
 
         # Step 2: assemble block-diagonal system and run OSD separately for X and Z errors
         for payloads, error_type in [(payloads_X, "X"), (payloads_Z, "Z")]:
+            time_start = t.time()
             active_nodes = [(p["node_id"], p.get("s", []), "H_reduced" in p)
                            for p in payloads if p.get("active", False)]
             inactive_nodes = [(p["node_id"], p.get("bp_corrections", []))
@@ -59,9 +65,11 @@ class CoordinatorProgram(Program):
                 corrections = self._project_corrections(e_global, registry) if np.any(e_global) else {}
             else:
                 corrections = {}
-            yield from self._send_corrections(context, payloads, corrections)
+            t_end = t.time()
+            t_tot = t_end - time_start
+            yield from self._send_corrections(context, payloads, corrections, t_tot)
 
-        # Step 6: aggregate logical-Z parities
+        # Step 3: aggregate logical-Z parities and determine the global parity
         global_parity = 0
         for name in self.node_names:
             msg = yield from context.csockets[name].recv()
@@ -72,14 +80,14 @@ class CoordinatorProgram(Program):
         status = "OK — no logical error" if global_parity == 0 else "FAIL — logical error survived!"
         print(f"\n=== Logical Z (global) = {global_parity} → {status} ===\n")
 
-        # Step 7: aggregate CNOT counts
+        # Step 4: collect the total CNOT gate count across all nodes
         global_cnot_count = 0
         for name in self.node_names:
             msg = yield from context.csockets[name].recv()
             global_cnot_count += json.loads(msg)
         print(f"=== Global CNOT count = {global_cnot_count} ===\n")
 
-        # Step 8: aggregate decoding times
+        # Step 5: collect decoding times and report the worst-case value
         max_time = 0
         for name in self.node_names:
             msg = yield from context.csockets[name].recv()
@@ -91,7 +99,7 @@ class CoordinatorProgram(Program):
         yield from context.connection.flush()
         return global_parity, global_cnot_count
 
-    # Step 2 — Assemble block-diagonal global system
+    # Assemble block-diagonal global system
     def _assemble_global_system(self, payloads: list) -> tuple:
         active = [p for p in payloads if p.get("active", False)]
         if not active:
@@ -129,7 +137,7 @@ class CoordinatorProgram(Program):
         llr_global = np.array(llr_list, dtype=float)
         return H_global, s_global, llr_global, registry
 
-    # Step 3 — Soft-decision OSD over GF(2)
+    # Soft-decision OSD decoder over GF(2)
     def _osd_gf2(self, H_global: np.ndarray, s_global: np.ndarray,
                  llr_global: np.ndarray = None, osd_order: int = 2) -> np.ndarray:
         m, K_tot = H_global.shape
@@ -193,7 +201,7 @@ class CoordinatorProgram(Program):
 
         return best_e_ord[inv_order]
 
-    # Step 4 — Back-project global error to per-node corrections
+    # Back-project global error estimate to per-node corrections
     def _project_corrections(self, e_global: np.ndarray, registry: list) -> dict:
         corrections = {}
         for reg in registry:
@@ -206,8 +214,8 @@ class CoordinatorProgram(Program):
             ]
         return corrections
 
-    # Step 5 — Send corrections merging OSD + BP
-    def _send_corrections(self, context: ProgramContext, payloads: list, corrections_per_node: dict):
+    # Merge OSD and BP corrections, then deliver results to each cluster node
+    def _send_corrections(self, context: ProgramContext, payloads: list, corrections_per_node: dict, t_tot):
         """Merge OSD corrections (active nodes) with BP corrections (inactive/converged nodes)."""
         bp_map: dict = {}
         for p in payloads:
@@ -228,4 +236,5 @@ class CoordinatorProgram(Program):
             bp_set  = set(tuple(c) for c in bp_corr)
             merged  = list(osd_set.symmetric_difference(bp_set))
             context.csockets[name].send(json.dumps(merged))
+            context.csockets[name].send(json.dumps(t_tot))
         yield from context.connection.flush()
